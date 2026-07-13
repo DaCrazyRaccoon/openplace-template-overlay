@@ -3,9 +3,9 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.3.12
-// @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/Openplace-Template-Overlay.user.js
-// @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/Openplace-Template-Overlay.user.js
+// @version      1.3.14
+// @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
+// @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
 // @supportURL   https://github.com/DaCrazyRaccoon/openplace-template-tool/issues
 // @match        https://openplace.live/beta*
@@ -1865,7 +1865,7 @@
                 <div class="rtpl-globaltoggles">
                     <label title="Show the on-map box and drag handles used to move or resize templates."><input type="checkbox" class="rtpl-edit"> Edit mode</label>
                     <label title="At close map zoom levels, draw each locked template pixel as a small centered dot."><input type="checkbox" class="rtpl-g-shrink"> Small pixels</label>
-                    <label title="Show only the most recently selected Openplace palette color on locked templates."><input type="checkbox" class="rtpl-g-selectedcolor"> Selected color mode</label>
+                    <label title="Show only the most recently selected openplace palette color on locked templates."><input type="checkbox" class="rtpl-g-selectedcolor"> Selected color mode</label>
                     <label><input type="checkbox" class="rtpl-g-easy"> Easy paint <span class="rtpl-info" tabindex="0" title="Only paint pixels that match the template's colour here; everything else stays as-is. Already-correct pixels are skipped too. Refresh the page after painting to see the proper changes.">?</span></label>
                     <label title="For visible templates, show correct pixels in green, missing pixels in yellow, and wrong pixels in red."><input type="checkbox" class="rtpl-g-err"> Error mode</label>
                     <label><input type="checkbox" class="rtpl-g-hidedone"> Hide completed colors</label>
@@ -1948,7 +1948,7 @@
         selectedColorCb.addEventListener("change", async (e) => {
             if (e.target.checked && selectedPaintColor == null) {
                 e.target.checked = false;
-                showToast("Select a color in the Openplace palette first.", "info");
+                showToast("Select a color in the openplace palette first.", "info");
                 return;
             }
             gSelectedColorMode = e.target.checked;

@@ -18,7 +18,7 @@ A template overlay and image-preparation userscript for openplace.
 ## Install
 
 1. Install a userscript manager for your browser.
-2. Open [Openplace-Template-Overlay.user.js](./Openplace-Template-Overlay.user.js).
+2. Open [openplace-Template-Overlay.user.js](./openplace-Template-Overlay.user.js).
 3. Select **Raw** on GitHub.
 4. Let your userscript manager install the script.
 5. Open `https://openplace.live/beta`.
