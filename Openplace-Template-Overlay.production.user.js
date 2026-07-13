@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.3.3
+// @version      1.3.4
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/Openplace-Template-Overlay.production.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/Openplace-Template-Overlay.production.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -993,7 +993,7 @@
     async function readImageDimensions(file) {
         const bytes = new Uint8Array(await file.slice(0, 262144).arrayBuffer());
         const be32 = (offset) => ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
-        if (bytes.length >= 24 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71) return { w: be32(16), h: be32(20) };
+        if (bytes.length >= 29 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71) return { w: be32(16), h: be32(20), png: { bitDepth: bytes[24], colorType: bytes[25], interlace: bytes[28] } };
         if (bytes.length >= 10 && bytes[0] === 0xff && bytes[1] === 0xd8) {
             for (let i = 2; i + 9 < bytes.length;) {
                 if (bytes[i] !== 0xff) { i++; continue; }
@@ -1016,16 +1016,143 @@
         return { ...result, sourceW: dimensions.w, sourceH: dimensions.h, scaled: true };
     }
 
+    function pngIdatTransform() {
+        let phase = "signature", header = [], length = 0, type = "", remaining = 0, crc = 0;
+        const readHeader = () => {
+            length = ((header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3]) >>> 0;
+            type = String.fromCharCode(header[4], header[5], header[6], header[7]);
+            remaining = length;
+            header = [];
+            phase = "data";
+        };
+        return new TransformStream({
+            transform(chunk, controller) {
+                let at = 0;
+                while (at < chunk.length) {
+                    if (phase === "signature") {
+                        const end = Math.min(chunk.length, at + 8 - header.length);
+                        header.push(...chunk.subarray(at, end));
+                        at = end;
+                        if (header.length === 8) {
+                            if (header.join(",") !== "137,80,78,71,13,10,26,10") throw new Error("The file is not a PNG.");
+                            header = [];
+                            phase = "header";
+                        }
+                        continue;
+                    }
+                    if (phase === "header") {
+                        const end = Math.min(chunk.length, at + 8 - header.length);
+                        header.push(...chunk.subarray(at, end));
+                        at = end;
+                        if (header.length === 8) readHeader();
+                        continue;
+                    }
+                    if (phase === "data") {
+                        const count = Math.min(remaining, chunk.length - at);
+                        if (type === "IDAT" && count) controller.enqueue(chunk.slice(at, at + count));
+                        at += count;
+                        remaining -= count;
+                        if (!remaining) { crc = 4; phase = "crc"; }
+                        continue;
+                    }
+                    const count = Math.min(crc, chunk.length - at);
+                    at += count;
+                    crc -= count;
+                    if (!crc) phase = "header";
+                }
+            }
+        });
+    }
+
+    const pngPaeth = (a, b, c) => {
+        const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+        return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+    };
+
+    async function decodePngStreamed(file, dimensions) {
+        const info = dimensions?.png;
+        if (!info || info.bitDepth !== 8 || info.interlace !== 0 || ![2, 6].includes(info.colorType)) throw new Error("This large PNG uses a format the streaming importer does not support.");
+        if (typeof DecompressionStream !== "function" || !file.stream) throw new Error("This browser cannot stream-decode PNG files.");
+        const safe = safeWorkingSize(dimensions.w, dimensions.h);
+        const channels = info.colorType === 6 ? 4 : 3, rowBytes = dimensions.w * channels;
+        const sourceX = new Int32Array(safe.w), sourceY = new Int32Array(safe.h);
+        for (let x = 0; x < safe.w; x++) sourceX[x] = Math.min(dimensions.w - 1, Math.floor((x + .5) * dimensions.w / safe.w));
+        for (let y = 0; y < safe.h; y++) sourceY[y] = Math.min(dimensions.h - 1, Math.floor((y + .5) * dimensions.h / safe.h));
+        const canvas = document.createElement("canvas");
+        canvas.width = safe.w; canvas.height = safe.h;
+        const ctx = canvas.getContext("2d");
+        const output = ctx.createImageData(safe.w, safe.h), data = output.data;
+        const scanline = new Uint8Array(rowBytes + 1);
+        let previous = new Uint8Array(rowBytes), current = new Uint8Array(rowBytes), filled = 0, sourceRow = 0, targetRow = 0;
+        const useScanline = () => {
+            const filter = scanline[0];
+            if (filter > 4) throw new Error("The PNG uses an invalid scanline filter.");
+            for (let i = 0; i < rowBytes; i++) {
+                const value = scanline[i + 1], left = i >= channels ? current[i - channels] : 0, up = previous[i], upperLeft = i >= channels ? previous[i - channels] : 0;
+                current[i] = (value + (filter === 1 ? left : filter === 2 ? up : filter === 3 ? ((left + up) >> 1) : filter === 4 ? pngPaeth(left, up, upperLeft) : 0)) & 255;
+            }
+            if (targetRow < safe.h && sourceY[targetRow] === sourceRow) {
+                const rowOffset = targetRow * safe.w * 4;
+                for (let x = 0; x < safe.w; x++) {
+                    const sourceOffset = sourceX[x] * channels, out = rowOffset + x * 4;
+                    data[out] = current[sourceOffset];
+                    data[out + 1] = current[sourceOffset + 1];
+                    data[out + 2] = current[sourceOffset + 2];
+                    data[out + 3] = channels === 4 ? current[sourceOffset + 3] : 255;
+                }
+                targetRow++;
+            }
+            [previous, current] = [current, previous];
+            sourceRow++;
+            if (!(sourceRow & 127)) showToast("Preparing " + dimensions.w + "×" + dimensions.h + " image: " + Math.min(99, Math.round(sourceRow / dimensions.h * 100)) + "%…", "progress", 0);
+        };
+        const reader = file.stream().pipeThrough(pngIdatTransform()).pipeThrough(new DecompressionStream("deflate")).getReader();
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                let at = 0;
+                while (at < value.length) {
+                    const count = Math.min(scanline.length - filled, value.length - at);
+                    scanline.set(value.subarray(at, at + count), filled);
+                    filled += count;
+                    at += count;
+                    if (filled === scanline.length) {
+                        useScanline();
+                        filled = 0;
+                    }
+                }
+            }
+        } finally {
+            reader.releaseLock();
+        }
+        if (filled || sourceRow !== dimensions.h || targetRow !== safe.h) throw new Error("The PNG data ended before the image was complete.");
+        ctx.putImageData(output, 0, 0);
+        const result = await canvasToPreparedImage(canvas);
+        return { ...result, sourceW: dimensions.w, sourceH: dimensions.h, scaled: true };
+    }
+
     async function prepareImageFile(file) {
         if (!isImageFile(file)) throw new Error("Please choose a supported image file.");
         showToast(`Reading ${file.name}…`, "progress", 0);
         const dimensions = await readImageDimensions(file);
+        const large = !!dimensions && safeWorkingSize(dimensions.w, dimensions.h).scaled;
 
         try {
             const resized = await decodeResizedBitmap(file, dimensions);
             if (resized) return resized;
         } catch (e) {
             LOG("resized bitmap decode unavailable", e);
+        }
+
+        if (large && dimensions?.png) {
+            try {
+                showToast(`Preparing ${dimensions.w}×${dimensions.h} image without full-size decoding…`, "progress", 0);
+                return await decodePngStreamed(file, dimensions);
+            } catch (e) {
+                LOG("streamed PNG decode unavailable", e);
+                throw new Error(file.name + " could not be safely resized: " + (e?.message || "unknown PNG decoding error"));
+            }
         }
 
         if (typeof ImageDecoder === "function" && file.type) {
@@ -1047,19 +1174,12 @@
             }
         }
 
+        if (large) throw new Error(file.name + " is too large for this browser to decode safely.");
+
         const url = await fileToDataUrl(file, (loaded, total) => total && showToast(`Reading ${file.name}: ${Math.round(loaded / total * 100)}%…`, "progress", 0));
         showToast(`Decoding ${file.name}…`, "progress", 0);
         const original = await loadImage(url, file.name);
-        const safe = safeWorkingSize(original.naturalWidth, original.naturalHeight);
-        if (!safe.scaled) return { dataUrl: url, img: original, sourceW: original.naturalWidth, sourceH: original.naturalHeight, scaled: false };
-        showToast(`Preparing ${original.naturalWidth}×${original.naturalHeight} image at ${safe.w}×${safe.h}…`, "progress", 0);
-        const canvas = document.createElement("canvas");
-        canvas.width = safe.w; canvas.height = safe.h;
-        const ctx = canvas.getContext("2d");
-        applyScaleAlgorithm(ctx, "high");
-        ctx.drawImage(original, 0, 0, safe.w, safe.h);
-        const result = await canvasToPreparedImage(canvas);
-        return { ...result, sourceW: original.naturalWidth, sourceH: original.naturalHeight, scaled: true };
+        return { dataUrl: url, img: original, sourceW: original.naturalWidth, sourceH: original.naturalHeight, scaled: false };
     }
 
     async function createTemplateFromFile(file, lngLat) {
