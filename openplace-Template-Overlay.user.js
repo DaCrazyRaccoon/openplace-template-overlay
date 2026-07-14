@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.3.14
+// @version      1.4.9
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -1253,7 +1253,7 @@
         } catch (e) { LOG("image import failed", e); const m = importError(file, e); showToast(m, "error", 7000); return null; }
     }
 
-    async function addTemplateFromDataUrl(dataUrl, name, lngLat, loadedImg = null) {
+    async function addTemplateFromDataUrl(dataUrl, name, lngLat, loadedImg = null, globalPosition = null) {
         if (!map) { setStatus("Map not ready yet — try again in a moment.", "error", 5000); return null; }
         const img = loadedImg || await loadImage(dataUrl, name || "image");
         const naturalW = img.naturalWidth, naturalH = img.naturalHeight;
@@ -1261,7 +1261,10 @@
 
 
         let gx, gy;
-        if (lngLat) {
+        if (Array.isArray(globalPosition) && Number.isFinite(globalPosition[0]) && Number.isFinite(globalPosition[1])) {
+            gx = Math.round(globalPosition[0]);
+            gy = Math.round(globalPosition[1]);
+        } else if (lngLat) {
             gx = Math.round(lngToGpx(lngLat[0]));
             gy = Math.round(latToGpy(lngLat[1]));
         } else {
@@ -1392,6 +1395,267 @@
         } catch (e) { return false; }
     }
 
+
+    const SHARE_CODE_PREFIX = "OPTT1";
+    const MAX_SHARE_CODE_CHARS = 50_000_000;
+    const SHARE_SERVICE_ORIGIN = "https://snowy-base-78d1.olivierdb.workers.dev";
+    const SHORT_SHARE_CODE = /^[A-Za-z0-9]{10}$/;
+    let shareDialog = null;
+
+    function bytesToShareText(bytes) {
+        let text = "";
+        for (let i = 0; i < bytes.length; i += 16384) text += String.fromCharCode(...bytes.subarray(i, i + 16384));
+        return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function shareTextToBytes(text) {
+        const base64 = text.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - text.length % 4) % 4);
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+
+    async function transformShareBytes(bytes, Stream) {
+        const stream = new Blob([bytes]).stream().pipeThrough(new Stream("gzip"));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    async function createShareCode(t) {
+        const payload = { v: 2, n: t.name, d: t.dataUrl, w: t.w, h: t.h, o: t.opacity, a: t.aspectLock, x: t.disabled || [], p: [t.gx, t.gy] };
+        const bytes = new TextEncoder().encode(JSON.stringify(payload));
+        if (typeof CompressionStream === "function") {
+            const compressed = await transformShareBytes(bytes, CompressionStream);
+            return SHARE_CODE_PREFIX + "G." + bytesToShareText(compressed);
+        }
+        return SHARE_CODE_PREFIX + "J." + bytesToShareText(bytes);
+    }
+
+    async function createShareIdentity(t) {
+        const identity = { d: t.dataUrl, w: t.w, h: t.h, o: t.opacity, a: t.aspectLock, x: [...(t.disabled || [])].sort((a, b) => a - b), p: [t.gx, t.gy] };
+        const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(identity)));
+        return bytesToShareText(new Uint8Array(hash));
+    }
+    async function readShareCode(code) {
+        const text = String(code || "").trim();
+        if (text.length > MAX_SHARE_CODE_CHARS) throw new Error("This share code is too large.");
+        const match = text.match(/^OPTT1([GJ])\.([A-Za-z0-9_-]+)$/);
+        if (!match) throw new Error("This is not a valid openplace template share code.");
+        let bytes = shareTextToBytes(match[2]);
+        if (match[1] === "G") {
+            if (typeof DecompressionStream !== "function") throw new Error("This browser cannot open compressed share codes.");
+            bytes = await transformShareBytes(bytes, DecompressionStream);
+        }
+        const payload = JSON.parse(new TextDecoder().decode(bytes));
+        if (![1, 2].includes(payload?.v) || typeof payload.d !== "string" || !/^data:image\//i.test(payload.d)) throw new Error("This share code does not contain a valid template image.");
+        return payload;
+    }
+
+    async function shareServiceRequest(path, options = {}) {
+        let response;
+        try {
+            response = await fetch(SHARE_SERVICE_ORIGIN + path, { credentials: "omit", cache: "no-store", ...options });
+        } catch (_) {
+            throw new Error("The sharing service could not be reached.");
+        }
+        const text = await response.text();
+        let body = null;
+        try { body = text ? JSON.parse(text) : null; } catch (_) {  }
+        if (!response.ok) throw new Error(body?.error || "The sharing service could not complete that request.");
+        return body ?? text;
+    }
+
+    function requestShareProof() {
+        return new Promise((resolve, reject) => {
+            const root = document.createElement("div");
+            const frame = document.createElement("iframe");
+            const origin = new URL(SHARE_SERVICE_ORIGIN).origin;
+            let settled = false;
+            const finish = (error, proof) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                window.removeEventListener("message", receive);
+                root.remove();
+                error ? reject(error) : resolve(proof);
+            };
+            const receive = (event) => {
+                if (event.origin !== origin || !event.data || typeof event.data !== "object") return;
+                if (event.data.type === "openplace-template-share-proof" && typeof event.data.token === "string") finish(null, event.data.token);
+                if (event.data.type === "openplace-template-share-error") finish(new Error(event.data.message || "Share verification failed."));
+            };
+            const timeout = setTimeout(() => finish(new Error("Share verification timed out.")), 120000);
+            Object.assign(root.style, { position: "fixed", inset: "0", zIndex: "2147483647", display: "grid", placeItems: "center", padding: "16px", background: "rgba(0,0,0,.62)" });
+            Object.assign(frame.style, { width: "min(380px,100%)", height: "190px", border: "1px solid #344150", borderRadius: "10px", background: "#10161c", boxShadow: "0 18px 48px #0009" });
+            root.addEventListener("click", (event) => { if (event.target === root) finish(new Error("Share verification cancelled.")); });
+            window.addEventListener("message", receive);
+            frame.src = SHARE_SERVICE_ORIGIN + "/v1/challenge";
+            root.appendChild(frame);
+            document.body.appendChild(root);
+        });
+    }
+
+    async function storeShareCode(payload, proof, identity) {
+        const result = await shareServiceRequest("/v1/share", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ payload, proof, identity }) });
+        if (!SHORT_SHARE_CODE.test(result?.code || "")) throw new Error("The sharing service returned an invalid share code.");
+        return result;
+    }
+
+    async function resolveShareCode(code) {
+        const text = String(code || "").trim();
+        if (text.startsWith(SHARE_CODE_PREFIX)) return text;
+        if (!SHORT_SHARE_CODE.test(text)) throw new Error("Enter a valid 10-character share code.");
+        const payload = await shareServiceRequest("/v1/share/" + text);
+        if (typeof payload !== "string") throw new Error("The sharing service returned an invalid template.");
+        return payload;
+    }
+    function getShareDialog() {
+        if (shareDialog) return shareDialog;
+        const root = document.createElement("div");
+        const box = document.createElement("div");
+        const icon = document.createElement("div");
+        const marker = document.createElement("div");
+        const title = document.createElement("div");
+        const subtitle = document.createElement("div");
+        const code = document.createElement("div");
+        const actions = document.createElement("div");
+        const primary = document.createElement("button");
+        const close = document.createElement("button");
+        const inputs = Array.from({ length: 10 }, () => document.createElement("input"));
+        const setCode = (value) => {
+            const chars = String(value || "").replace(/[^A-Za-z0-9]/g, "").slice(0, inputs.length).split("");
+            inputs.forEach((input, index) => { input.value = chars[index] || ""; });
+        };
+        const getCode = () => inputs.map((input) => input.value).join("");
+        const setReadOnly = (readOnly) => inputs.forEach((input) => { input.readOnly = readOnly; input.tabIndex = readOnly ? -1 : 0; });
+        Object.assign(root.style, { position: "fixed", inset: "0", zIndex: "2147483647", display: "none", alignItems: "center", justifyContent: "center", padding: "16px", background: "rgba(0,0,0,.62)" });
+        Object.assign(box.style, { width: "min(430px,100%)", boxSizing: "border-box", display: "flex", flexDirection: "column", alignItems: "stretch", gap: "12px", padding: "20px", border: "1px solid #344150", borderRadius: "14px", background: "#10161c", color: "#eef3f8", font: "13px system-ui,sans-serif", boxShadow: "0 18px 48px #0009" });
+        Object.assign(icon.style, { width: "42px", height: "42px", display: "grid", placeItems: "center", alignSelf: "center", border: "1px solid #2e3947", borderRadius: "50%", background: "#131b25" });
+        Object.assign(marker.style, { width: "15px", height: "15px", border: "1px dashed #dce6f0", borderRadius: "3px" });
+        Object.assign(title.style, { textAlign: "center", fontSize: "16px", fontWeight: "700", marginTop: "2px" });
+        Object.assign(subtitle.style, { minHeight: "18px", textAlign: "center", color: "#9eabb9", fontSize: "12px" });
+        Object.assign(code.style, { display: "grid", gridTemplateColumns: "repeat(10,minmax(0,1fr))", gap: "5px" });
+        for (const [index, input] of inputs.entries()) {
+            input.type = "text";
+            input.maxLength = 1;
+            input.autocomplete = index === 0 ? "one-time-code" : "off";
+            input.inputMode = "text";
+            input.spellcheck = false;
+            Object.assign(input.style, { minWidth: "0", height: "42px", boxSizing: "border-box", border: "1px solid #344150", borderRadius: "7px", outline: "none", background: "#0c1116", color: "#eef3f8", textAlign: "center", font: "700 18px ui-monospace,monospace" });
+            input.addEventListener("focus", () => { input.style.borderColor = "#4b82ed"; });
+            input.addEventListener("blur", () => { input.style.borderColor = "#344150"; });
+            input.addEventListener("input", () => {
+                input.value = input.value.replace(/[^A-Za-z0-9]/g, "").slice(-1);
+                if (input.value && index < inputs.length - 1) inputs[index + 1].focus();
+            });
+            input.addEventListener("keydown", (event) => {
+                if (event.key === "Backspace" && !input.value && index > 0) { inputs[index - 1].focus(); inputs[index - 1].select(); }
+            });
+            input.addEventListener("paste", (event) => {
+                const pasted = event.clipboardData?.getData("text");
+                if (!pasted) return;
+                event.preventDefault();
+                setCode(pasted);
+                const next = Math.min(getCode().length, inputs.length - 1);
+                inputs[next].focus();
+            });
+            code.appendChild(input);
+        }
+        Object.assign(actions.style, { display: "flex", flexDirection: "column", gap: "8px", marginTop: "2px" });
+        Object.assign(primary.style, { width: "100%", minHeight: "40px", border: "1px solid #4a82ed", borderRadius: "7px", background: "#477df0", color: "#fff", fontWeight: "650", cursor: "pointer" });
+        Object.assign(close.style, { alignSelf: "center", padding: "3px 8px", border: "none", background: "transparent", color: "#9eabb9", fontSize: "11px", cursor: "pointer" });
+        icon.appendChild(marker);
+        root.addEventListener("click", (event) => { if (event.target === root) root.style.display = "none"; });
+        close.addEventListener("click", () => { root.style.display = "none"; });
+        actions.append(primary, close);
+        box.append(icon, title, subtitle, code, actions);
+        root.appendChild(box);
+        document.body.appendChild(root);
+        shareDialog = { root, box, title, subtitle, inputs, primary, close, setCode, getCode, setReadOnly };
+        return shareDialog;
+    }
+
+    function showShareCode(code) {
+        const dialog = getShareDialog();
+        dialog.title.textContent = "Share template";
+        dialog.subtitle.textContent = "Send this 10-character code to another user.";
+        dialog.setCode(code);
+        dialog.setReadOnly(true);
+        dialog.primary.textContent = "Copy share code";
+        dialog.close.textContent = "Close";
+        dialog.primary.onclick = async () => showToast(await copyToClipboard(dialog.getCode()) ? "Share code copied." : "Copy failed. Select the code and copy it manually.", "info", 5000);
+        dialog.root.style.display = "flex";
+    }
+
+    function showImportShareDialog() {
+        const dialog = getShareDialog();
+        dialog.title.textContent = "Import template";
+        dialog.subtitle.textContent = "Enter the 10-character code you received.";
+        dialog.setCode("");
+        dialog.setReadOnly(false);
+        dialog.primary.textContent = "Import template";
+        dialog.close.textContent = "Cancel";
+        dialog.primary.onclick = async () => {
+            try {
+                await importShareCode(dialog.getCode());
+                dialog.root.style.display = "none";
+            } catch (e) {
+                showToast(e?.message || "Could not import this share code.", "error", 7000);
+            }
+        };
+        dialog.root.style.display = "flex";
+        dialog.inputs[0].focus();
+    }
+
+    async function shareTemplate(t) {
+        if (!t?.locked) {
+            showToast("Lock this template before sharing it.", "info");
+            return;
+        }
+        showToast("Preparing share code…", "progress", 0);
+        try {
+            const payload = await createShareCode(t);
+            const identity = await createShareIdentity(t);
+            showToast("Complete verification to create a share code…", "progress", 0);
+            const proof = await requestShareProof();
+            showToast("Saving share code…", "progress", 0);
+            const result = await storeShareCode(payload, proof, identity);
+            showShareCode(result.code);
+            const message = result.reused ? "Existing share code copied." : "Share code copied.";
+            showToast(await copyToClipboard(result.code) ? message : "Share code is ready to copy.", "success", 5000);
+        } catch (e) {
+            showToast(e?.message || "Could not create a share code.", "error", 7000);
+        }
+    }
+
+    async function importShareCode(code) {
+        showToast("Reading shared template…", "progress", 0);
+        const shared = await readShareCode(await resolveShareCode(code));
+        const img = await loadImage(shared.d, "shared template");
+        const placement = lastPixel ? [gpxToLng(lastPixel.gx), gpyToLat(lastPixel.gy)] : null;
+        const sharedPosition = Array.isArray(shared.p) && Number.isFinite(shared.p[0]) && Number.isFinite(shared.p[1]) ? shared.p : null;
+        const t = await addTemplateFromDataUrl(shared.d, String(shared.n || "Shared template").slice(0, 120), placement, img, sharedPosition);
+        if (!t) throw new Error("The map is not ready yet.");
+        const safe = safeWorkingSize(Number(shared.w) || img.naturalWidth, Number(shared.h) || img.naturalHeight);
+        t.w = safe.w;
+        t.h = safe.h;
+        if (sharedPosition) {
+            t.gx = clamp(Math.round(sharedPosition[0]), 0, WORLD_PIXELS - safe.w);
+            t.gy = clamp(Math.round(sharedPosition[1]), 0, WORLD_PIXELS - safe.h);
+        }
+        t.opacity = clamp(Number(shared.o), 0, 1);
+        if (!Number.isFinite(t.opacity)) t.opacity = .7;
+        t.aspectLock = shared.a !== false;
+        t.disabled = Array.isArray(shared.x) ? shared.x.filter((index) => PALETTE_BY_INDEX[index]) : [];
+        t.locked = true;
+        resetTemplateCaches(t);
+        await updateTemplateTiles(t);
+        renderPanel();
+        updateOverlay();
+        storeSet();
+        showToast(sharedPosition ? "Shared template added locked at its original location." : "Shared template added locked.", "success", 5000);
+        return t;
+    }
 
     async function copyTemplateCoords(t) {
         const { tx, ty, px, py } = gpToTilePixel(t.gx, t.gy);
@@ -1813,14 +2077,17 @@
         panel = document.createElement("div");
         panel.className = "rtpl-panel rtpl-hidden";
         panel.innerHTML = `
-            <div class="rtpl-head">
-                <span>Templates</span>
-                <button class="rtpl-x" title="Close">✕</button>
+            <div class="rtpl-top">
+                <div class="rtpl-head">
+                    <span>Templates</span>
+                    <button class="rtpl-x" title="Close">✕</button>
+                </div>
+                <div class="rtpl-account" style="display:none"></div>
             </div>
-            <div class="rtpl-account" style="display:none"></div>
             <div class="rtpl-actions rtpl-actions-row">
                 <button class="rtpl-add rtpl-addimg">Add image</button>
                 <button class="rtpl-add rtpl-openeditor">Image editor</button>
+                <button class="rtpl-add rtpl-importcode">Import code</button>
                 <input type="file" accept="image/*" multiple class="rtpl-file" hidden>
             </div>
             <div class="rtpl-actions rtpl-tp">
@@ -1901,6 +2168,7 @@
         const fileInput = panel.querySelector(".rtpl-file");
         panel.querySelector(".rtpl-addimg").addEventListener("click", () => fileInput.click());
         panel.querySelector(".rtpl-openeditor").addEventListener("click", () => openEditor());
+        panel.querySelector(".rtpl-importcode").addEventListener("click", showImportShareDialog);
 
 
         const tpInput = panel.querySelector(".rtpl-tp-input");
@@ -2261,6 +2529,7 @@
                         `}
                     </div>${t.locked ? `
                     <div class="rtpl-coordstr">tX: ${tx}  tY: ${ty}  X: ${px}  Y: ${py}</div>
+                    <div class="rtpl-row3"><button class="rtpl-toggle rtpl-share">Share code</button></div>
                     ` : `
                     <div class="rtpl-row3">
                         <label class="rtpl-num">X tile<input type="number" class="rtpl-tx" value="${tx}"></label>
@@ -2293,6 +2562,7 @@
                 if (!t.collapsed && t.locked) refreshAnalysis(t, card);
             });
             card.querySelector(".rtpl-go").addEventListener("click", () => goToTemplate(t));
+            card.querySelector(".rtpl-share")?.addEventListener("click", () => shareTemplate(t));
 
             for (const sel of [".rtpl-dim", ".rtpl-coordstr"]) {
                 const el = card.querySelector(sel);
@@ -2742,8 +3012,8 @@
         .rtpl-ed-loading-bar{position:relative;width:140px;height:4px;border-radius:3px;overflow:hidden;background:rgba(255,159,28,.2)}
         .rtpl-ed-loading-bar::before{content:"";position:absolute;top:0;left:0;height:100%;width:40%;background:#ff9f1c;border-radius:3px;will-change:transform;animation:rtpl-ind 1.1s linear infinite}
         @keyframes rtpl-ind{0%{transform:translateX(-110%)}100%{transform:translateX(360%)}}
-        .rtpl-panel{width:344px;background:#10151b;border:1px solid #29333e;border-radius:14px;box-shadow:0 18px 48px rgba(0,0,0,.48);font-size:13px}
-        .rtpl-head{padding:13px 14px;background:#151c24;border-bottom:1px solid #29333e;border-radius:14px 14px 0 0;font-size:14px;letter-spacing:.1px}
+        .rtpl-panel{width:344px;background:#10151b;border:1px solid #29333e;border-radius:14px;box-shadow:0 18px 48px rgba(0,0,0,.48);font-size:13px;padding-bottom:12px;box-sizing:border-box}
+        .rtpl-top{position:sticky;top:0;z-index:3}.rtpl-head{padding:13px 14px;background:#151c24;border-bottom:1px solid #29333e;border-radius:14px 14px 0 0;font-size:14px;letter-spacing:.1px;position:static;z-index:auto}.rtpl-account{position:static;z-index:auto}
         .rtpl-panel .rtpl-actions{padding:10px 12px 0}
         .rtpl-panel .rtpl-actions-row{gap:8px}
         .rtpl-panel .rtpl-actions-row .rtpl-add{min-height:36px;border-style:solid;border-radius:8px;font-weight:600}
@@ -2927,14 +3197,14 @@
                 </div>
             </div>
             <div class="rtpl-ed-controls">
-                <button class="rtpl-add rtpl-ed-import">📁 Import image…</button>
+                <button class="rtpl-add rtpl-ed-import">Import image…</button>
                 <input type="file" accept="image/*" class="rtpl-ed-file" hidden>
                 <label class="rtpl-ed-ctl">Preset
                     <select class="rtpl-ed-preset"></select>
                 </label>
                 <button class="rtpl-toggle rtpl-ed-preset-save" title="Save current colors as a new preset">💾</button>
                 <button class="rtpl-toggle rtpl-ed-preset-del" title="Delete the selected saved preset" disabled>🗑️</button>
-                <button class="rtpl-toggle rtpl-ed-palbtn" title="Pick exactly which colors the dither may use">🎨 Colors</button>
+                <button class="rtpl-toggle rtpl-ed-palbtn" title="Pick exactly which colors the dither may use">Colors</button>
                 <label class="rtpl-ed-ctl">Dither
                     <select class="rtpl-ed-algo">${algoOpts}</select>
                 </label>
@@ -2953,9 +3223,9 @@
                 </div>
                 <button class="rtpl-toggle rtpl-ed-view">⇆ Side by side</button>
                 <div class="rtpl-ed-apply">
-                    <button class="rtpl-add rtpl-ed-download">⬇ Download</button>
-                    <button class="rtpl-add rtpl-ed-new">➕ Add as new template</button>
-                    <button class="rtpl-add rtpl-ed-replace" disabled>♻ Replace source template</button>
+                    <button class="rtpl-add rtpl-ed-download">Download</button>
+                    <button class="rtpl-add rtpl-ed-new">Add as new template</button>
+                    <button class="rtpl-add rtpl-ed-replace" disabled>Replace source template</button>
                 </div>
             </div>
             <div class="rtpl-ed-palette">
@@ -2968,7 +3238,7 @@
                 <div class="rtpl-ed-pal-grid"></div>
             </div>
             <div class="rtpl-ed-stage" style="--split:50">
-                <div class="rtpl-ed-pane rtpl-ed-pane-before"><div class="rtpl-ed-label">Before</div><div class="rtpl-ed-canwrap"><canvas class="rtpl-ed-before"></canvas></div><div class="rtpl-ed-empty">Click here to import an image — or use ✏️ Edit on a template.</div></div>
+                <div class="rtpl-ed-pane rtpl-ed-pane-before"><div class="rtpl-ed-label">Before</div><div class="rtpl-ed-canwrap"><canvas class="rtpl-ed-before"></canvas></div><div class="rtpl-ed-empty">Click here to import an image — or use Edit on a template.</div></div>
                 <div class="rtpl-ed-pane rtpl-ed-pane-after"><div class="rtpl-ed-label">After (<span class="rtpl-ed-after-info">—</span>)</div><div class="rtpl-ed-canwrap"><canvas class="rtpl-ed-after"></canvas></div><div class="rtpl-ed-loading"><div class="rtpl-ed-loading-msg">Loading…</div><div class="rtpl-ed-loading-bar"></div></div></div>
                 <div class="rtpl-ed-handle"><div class="rtpl-ed-knob">⇆</div></div>
             </div>
@@ -3319,7 +3589,7 @@
     function updatePalCount() {
         if (!editor) return;
         const btn = editor.querySelector(".rtpl-ed-palbtn");
-        if (btn) btn.textContent = `🎨 Colors (${editorColorSet.size})`;
+        if (btn) btn.textContent = `Colors (${editorColorSet.size})`;
         const el = editor.querySelector(".rtpl-ed-pal-count");
         if (el) el.textContent = `${editorColorSet.size} / ${PALETTE.length} enabled`;
     }

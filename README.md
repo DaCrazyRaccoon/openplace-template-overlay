@@ -13,7 +13,7 @@ A template overlay and image-preparation userscript for openplace.
 - Shows upload progress and clear upload errors.
 - Uses the selected map pixel as the placement point when adding an image.
 - Includes a selected-color setting for locked templates.
-- Includes error comparison, easy paint, coordinate jump/copy, painted-area download, and keyboard panning.
+- Includes error comparison, easy paint, coordinate jump/copy, painted-area download, keyboard panning, and template share codes
 
 ## Install
 
@@ -51,7 +51,6 @@ Install [Tampermonkey for Safari](https://www.tampermonkey.net/index.php?browser
 6. To show one paint color only on locked templates, select a color in the openplace palette, then enable **Selected color mode** in Settings.
 
 The image editor can convert an image to the openplace palette before adding it as a new template or replacing an existing template.
-
 
 ## License
 
