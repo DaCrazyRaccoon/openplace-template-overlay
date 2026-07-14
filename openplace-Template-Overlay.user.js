@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.4.13
+// @version      1.4.16
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -162,9 +162,10 @@
             if (!t.visible) continue;
             const a = t._analysis;
             if (!a || !a.target) continue;
-            if (gx < a.gx || gy < a.gy || gx >= a.gx + a.w || gy >= a.gy + a.h) continue;
+            const wrappedX = unwrapHorizontalNear(gx, a.gx + a.w / 2);
+            if (wrappedX < a.gx || gy < a.gy || wrappedX >= a.gx + a.w || gy >= a.gy + a.h) continue;
             inBounds = true;
-            const idx = (gy - a.gy) * a.w + (gx - a.gx);
+            const idx = (gy - a.gy) * a.w + (wrappedX - a.gx);
             const tcol = a.target[idx];
             if (tcol >= 0) { target = tcol; correct = !!(a.correct && a.correct[idx]); break; }
         }
@@ -616,6 +617,12 @@
         return [[left, top], [right, top], [right, bottom], [left, bottom]];
     };
 
+    function rasterCoordinates(x0, x1, y0, y1) {
+        const left = wrapHorizontal(x0), right = left + x1 - x0;
+        const top = gpyToLat(y0), bottom = gpyToLat(y1);
+        return [[gpxToLng(left), top], [gpxToLng(right), top], [gpxToLng(right), bottom], [gpxToLng(left), bottom]];
+    }
+
     function refreshCanvasSource(id) {
         const s = map.getSource(id);
         if (s && typeof s.play === "function") {
@@ -696,10 +703,7 @@
                 const offX = ix0 - t.gx, offY = iy0 - t.gy, ow = ix1 - ix0, oh = iy1 - iy0;
                 if (ow <= 0 || oh <= 0 || e.offX !== offX || e.offY !== offY || e.ow !== ow || e.oh !== oh) continue;
                 try {
-                    map.getSource(e.sourceId)?.setCoordinates([
-                        [gpxToLng(ix0), gpyToLat(iy0)], [gpxToLng(ix1), gpyToLat(iy0)],
-                        [gpxToLng(ix1), gpyToLat(iy1)], [gpxToLng(ix0), gpyToLat(iy1)]
-                    ]);
+                    map.getSource(e.sourceId)?.setCoordinates(rasterCoordinates(ix0, ix1, iy0, iy1));
                 } catch (_) {}
             }
         };
@@ -815,7 +819,7 @@
 
         for (let ty = tya; ty <= tyb; ty++) {
             for (let tx = txa; tx <= txb; tx++) {
-                if (tx < 0 || ty < 0 || tx >= TILE_COUNT || ty >= TILE_COUNT) continue;
+                if (ty < 0 || ty >= TILE_COUNT) continue;
                 const tileLeft = tx * TILE_SIZE, tileTop = ty * TILE_SIZE;
 
                 const ix0 = Math.max(t.gx, tileLeft), iy0 = Math.max(t.gy, tileTop);
@@ -851,10 +855,7 @@
                     e.sig = sig; e.cw = cw; e.ch = ch; e.offX = offX; e.offY = offY; e.ow = ow; e.oh = oh;
                 }
 
-                const coords = [
-                    [gpxToLng(ix0), gpyToLat(iy0)], [gpxToLng(ix1), gpyToLat(iy0)],
-                    [gpxToLng(ix1), gpyToLat(iy1)], [gpxToLng(ix0), gpyToLat(iy1)]
-                ];
+                const coords = rasterCoordinates(ix0, ix1, iy0, iy1);
 
                 if (fresh || dimsChanged || !map.getSource(e.sourceId)) {
                     if (map.getLayer(e.layerId)) map.removeLayer(e.layerId);
@@ -905,7 +906,7 @@
 
         for (let ty = tya; ty <= tyb; ty++) {
             for (let tx = txa; tx <= txb; tx++) {
-                if (tx < 0 || ty < 0 || tx >= TILE_COUNT || ty >= TILE_COUNT) continue;
+                if (ty < 0 || ty >= TILE_COUNT) continue;
                 const tileLeft = tx * TILE_SIZE, tileTop = ty * TILE_SIZE;
 
                 const ix0 = Math.max(t.gx, tileLeft), iy0 = Math.max(t.gy, tileTop);
@@ -943,10 +944,7 @@
                     e.sig = sig; e.ix0 = ix0; e.iy0 = iy0; e.offX = offX; e.offY = offY; e.ow = ow; e.oh = oh;
                 }
 
-                const coords = [
-                    [gpxToLng(ix0), gpyToLat(iy0)], [gpxToLng(ix1), gpyToLat(iy0)],
-                    [gpxToLng(ix1), gpyToLat(iy1)], [gpxToLng(ix0), gpyToLat(iy1)]
-                ];
+                const coords = rasterCoordinates(ix0, ix1, iy0, iy1);
 
                 if (fresh || !map.getSource(e.sourceId)) {
                     map.addSource(e.sourceId, { type: "canvas", canvas: e.canvas, coordinates: coords, animate: false });
@@ -1222,7 +1220,7 @@
             gx = Math.round(lngToGpx(c.lng)) - Math.round(safe.w / 2);
             gy = Math.round(latToGpy(c.lat)) - Math.round(safe.h / 2);
         }
-        gx = clamp(gx, 0, WORLD_PIXELS - safe.w);
+        gx = wrapHorizontal(gx);
         gy = clamp(gy, 0, WORLD_PIXELS - safe.h);
 
         const t = {
@@ -1253,6 +1251,8 @@
     });
 
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const wrapHorizontal = (x) => ((x % WORLD_PIXELS) + WORLD_PIXELS) % WORLD_PIXELS;
+    const unwrapHorizontalNear = (x, reference) => x + Math.round((reference - x) / WORLD_PIXELS) * WORLD_PIXELS;
 
     function resetTemplateCaches(t) {
         t._procCanvas = null; t._procSig = null;
@@ -1582,7 +1582,7 @@
         t.w = safe.w;
         t.h = safe.h;
         if (sharedPosition) {
-            t.gx = clamp(Math.round(sharedPosition[0]), 0, WORLD_PIXELS - safe.w);
+            t.gx = wrapHorizontal(Math.round(sharedPosition[0]));
             t.gy = clamp(Math.round(sharedPosition[1]), 0, WORLD_PIXELS - safe.h);
         }
         t.opacity = clamp(Number(shared.o), 0, 1);
@@ -1718,7 +1718,10 @@
     const dragHandleSize = () => matchMedia("(pointer: coarse)").matches ? 28 : 16;
 
     function projGp(gx, gy) {
-        const p = map.project([gpxToLng(gx), gpyToLat(gy)]);
+        const lng = gpxToLng(gx);
+        const center = map.getCenter().lng;
+        const wrappedLng = lng + Math.round((center - lng) / 360) * 360;
+        const p = map.project([wrappedLng, gpyToLat(gy)]);
         return [p.x, p.y];
     }
 
@@ -1807,7 +1810,8 @@
             e.preventDefault();
             e.stopPropagation();
             try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
-            const [pgx, pgy] = clientToGp(e.clientX, e.clientY);
+            const [rawX, pgy] = clientToGp(e.clientX, e.clientY);
+            const pgx = unwrapHorizontalNear(rawX, t.gx + t.w / 2);
             drag = {
                 pointerId: e.pointerId,
                 mode: handle ? "resize" : "move",
@@ -1823,7 +1827,8 @@
             if (!t) return;
             e.preventDefault();
             e.stopPropagation();
-            const [pgx, pgy] = clientToGp(e.clientX, e.clientY);
+            const [rawX, pgy] = clientToGp(e.clientX, e.clientY);
+            const pgx = unwrapHorizontalNear(rawX, drag.pStart.gx);
             const dx = pgx - drag.pStart.gx;
             const dy = pgy - drag.pStart.gy;
 
@@ -1831,7 +1836,7 @@
 
                 const nx = Math.round(drag.start.gx + dx);
                 const ny = Math.round(drag.start.gy + dy);
-                t.gx = clamp(nx, 0, WORLD_PIXELS - t.w);
+                t.gx = wrapHorizontal(nx);
                 t.gy = clamp(ny, 0, WORLD_PIXELS - t.h);
             } else {
                 resizeFromHandle(t, drag, pgx, pgy, e.shiftKey);
@@ -1869,10 +1874,10 @@
         const def = HANDLES.find((h) => h.id === d.handle);
         let left = s.gx, top = s.gy, right = s.gx + s.w, bottom = s.gy + s.h;
 
-        let pX = Math.round(pgx), pY = Math.round(pgy);
-
         const movesX = def.fx ? "x" : null;
         const movesY = def.fy ? "y" : null;
+        const edgeX = def.fx === "left" ? s.gx + s.w : s.gx;
+        let pX = Math.round(unwrapHorizontalNear(pgx, edgeX)), pY = Math.round(pgy);
 
         if (movesX) {
             if (def.fx === "left") right = Math.max(left + 1, pX);
@@ -1894,7 +1899,7 @@
             if (def.fy === "top") bottom = top + h; else top = bottom - h;
         }
 
-        t.gx = clamp(Math.round(left), 0, WORLD_PIXELS - 1);
+        t.gx = wrapHorizontal(Math.round(left));
         t.gy = clamp(Math.round(top), 0, WORLD_PIXELS - 1);
         t.w = Math.max(1, Math.round(right - left));
         t.h = Math.max(1, Math.round(bottom - top));
@@ -2586,7 +2591,7 @@
                     const nty = clamp(parseInt(card.querySelector(".rtpl-ty").value) || 0, 0, TILE_COUNT - 1);
                     const npx = clamp(parseInt(card.querySelector(".rtpl-px").value) || 1, 1, TILE_SIZE);
                     const npy = clamp(parseInt(card.querySelector(".rtpl-py").value) || 1, 1, TILE_SIZE);
-                    t.gx = clamp(ntx * TILE_SIZE + npx - 1, 0, WORLD_PIXELS - t.w);
+                    t.gx = wrapHorizontal(ntx * TILE_SIZE + npx - 1);
                     t.gy = clamp(nty * TILE_SIZE + npy - 1, 0, WORLD_PIXELS - t.h);
                     markGeometryChanged(t);
                     await updateTemplateTiles(t); updateOverlay(); storeSet();
@@ -2596,7 +2601,7 @@
                 }
                 card.querySelector(".rtpl-usepixel").addEventListener("click", async () => {
                     if (!lastPixel) { flashStatus("Click a pixel on the map first, then use this.", 3500, "error"); return; }
-                    t.gx = clamp(lastPixel.gx, 0, WORLD_PIXELS - t.w);
+                    t.gx = wrapHorizontal(lastPixel.gx);
                     t.gy = clamp(lastPixel.gy, 0, WORLD_PIXELS - t.h);
                     markGeometryChanged(t);
                     await updateTemplateTiles(t); updateOverlay(); renderPanel(); storeSet();
@@ -3726,7 +3731,7 @@
                 t.dataUrl = dataUrl;
                 t.naturalW = img.naturalWidth; t.naturalH = img.naturalHeight;
                 t.w = t.naturalW; t.h = t.naturalH;
-                t.gx = clamp(t.gx, 0, WORLD_PIXELS - t.w);
+                t.gx = wrapHorizontal(t.gx);
                 t.gy = clamp(t.gy, 0, WORLD_PIXELS - t.h);
                 resetTemplateCaches(t);
                 t._imgEl = img; t._imgPromise = null;
@@ -3787,6 +3792,7 @@
                     ...savedTemplate,
                     disabled: Array.isArray(savedTemplate.disabled) ? savedTemplate.disabled : []
                 };
+                template.gx = wrapHorizontal(Math.round(Number(template.gx) || 0));
                 if (Array.isArray(savedTemplate.colorUsage) && savedTemplate.colorUsageFor === colorUsageSignature(template)) {
                     template._usage = savedTemplate.colorUsage
                         .filter((u) => PALETTE_BY_INDEX[u?.index] && Number.isFinite(u.count) && u.count > 0)
