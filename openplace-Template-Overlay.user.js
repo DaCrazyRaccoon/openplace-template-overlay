@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.4.9
+// @version      1.4.10
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -1653,6 +1653,7 @@
         renderPanel();
         updateOverlay();
         storeSet();
+        goToTemplate(t);
         showToast(sharedPosition ? "Shared template added locked at its original location." : "Shared template added locked.", "success", 5000);
         return t;
     }
