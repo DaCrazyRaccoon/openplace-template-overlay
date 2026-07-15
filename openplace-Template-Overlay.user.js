@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.4.18
+// @version      1.6.1
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -33,6 +33,7 @@
     const SCALE_ALGORITHMS = [["nearest","Nearest-neighbor (crisp)"],["low","Smooth — low quality"],["medium","Smooth — medium quality"],["high","Smooth — high quality"]];
 
     const LOG = (...a) => console.log("%c[Template]", "color:#3a86ff", ...a);
+    const SCRIPT_VERSION = "1.6.1";
 
     const pageWin = (typeof unsafeWindow !== "undefined" && unsafeWindow) || window;
 
@@ -272,8 +273,9 @@
         saveTimer = setTimeout(() => rawSet(STORE_KEY, JSON.stringify(templates.map(serialize))), 400);
     }
 
+    const settingsSnapshot = () => ({ editMode, errorMode, gOutlineMode, gShrink, gEasyPaint, gHideCompleted, dlOutline, gPanStep, gColorSort, gMapScaleAlgorithm, gEditorScaleAlgorithm, gSelectedColorMode, selectedPaintColor, panelPosition, fabPosition, panelOpen, performanceMode, walkthroughSeen, lastSeenVersion });
     function saveSettings() {
-        rawSet(SETTINGS_KEY, JSON.stringify({ editMode, errorMode, gOutlineMode, gShrink, gEasyPaint, gHideCompleted, dlOutline, gPanStep, gColorSort, gMapScaleAlgorithm, gEditorScaleAlgorithm, gSelectedColorMode, selectedPaintColor, panelPosition, fabPosition, panelOpen }));
+        rawSet(SETTINGS_KEY, JSON.stringify(settingsSnapshot()));
     }
     async function loadSettings() {
         try {
@@ -298,6 +300,9 @@
             if (Number.isFinite(s.panelPosition?.left) && Number.isFinite(s.panelPosition?.top)) panelPosition = { left: s.panelPosition.left, top: s.panelPosition.top };
             if (Number.isFinite(s.fabPosition?.left) && Number.isFinite(s.fabPosition?.top)) fabPosition = { left: s.fabPosition.left, top: s.fabPosition.top };
             if (typeof s.panelOpen === "boolean") panelOpen = s.panelOpen;
+            if (typeof s.performanceMode === "boolean") performanceMode = s.performanceMode;
+            if (typeof s.walkthroughSeen === "boolean") walkthroughSeen = s.walkthroughSeen;
+            if (typeof s.lastSeenVersion === "string") lastSeenVersion = s.lastSeenVersion;
         } catch (e) {  }
     }
 
@@ -324,6 +329,32 @@
         colorUsageFor: t._usageFor
     });
 
+    const BACKUP_FORMAT = "openplace-template-overlay-backup";
+    function downloadBackup() {
+        const backup = { format: BACKUP_FORMAT, version: 1, createdAt: new Date().toISOString(), templates: templates.map(serialize), settings: settingsSnapshot(), presets: userPresets };
+        const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `openplace-template-backup-${new Date().toISOString().slice(0, 10)}.json`;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        showToast("Backup exported.", "success");
+    }
+
+    async function importBackup(file) {
+        showToast("Reading backup…", "progress", 0);
+        const backup = JSON.parse(await file.text());
+        if (!backup || backup.format !== BACKUP_FORMAT || !Array.isArray(backup.templates) || !Array.isArray(backup.presets)) throw new Error("This is not a valid openplace Template Overlay backup.");
+        const templatesBackup = backup.templates.filter((t) => t && typeof t.dataUrl === "string" && /^data:image\//.test(t.dataUrl) && Number.isFinite(t.w) && Number.isFinite(t.h) && t.w > 0 && t.h > 0);
+        if (!confirm(`Restore ${templatesBackup.length} template${templatesBackup.length === 1 ? "" : "s"}? This replaces your current templates, presets, and settings.`)) { showToast("Backup import cancelled.", "info"); return; }
+        clearTimeout(saveTimer);
+        await rawSet(STORE_KEY, JSON.stringify(templatesBackup));
+        await rawSet(PRESETS_KEY, JSON.stringify(backup.presets));
+        await rawSet(SETTINGS_KEY, JSON.stringify(backup.settings && typeof backup.settings === "object" ? backup.settings : {}));
+        showToast("Backup restored. Reloading…", "success", 1200);
+        setTimeout(() => location.reload(), 300);
+    }
+
     let map = null;
 
     let templates = [];
@@ -337,7 +368,7 @@
     const OUTLINE_LABELS = { off: "Off", all: "All edges", outer: "Outer edge" };
     let gShrink = true;
     const SHRINK = 3;
-    const DOT_MAX_DIM = 4096;
+    const DOT_FULL_PIXEL_LIMIT = 4_000_000;
     const MIN_TEMPLATE_ZOOM = 9;
     const DOT_ZOOM = 13;
     let gEasyPaint = false;
@@ -348,6 +379,8 @@
     let gMapScaleAlgorithm = "high", gEditorScaleAlgorithm = "high";
     let gSelectedColorMode = false;
     let panelPosition = null, fabPosition = null, panelOpen = false;
+    let performanceMode = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
+    let walkthroughSeen = false, lastSeenVersion = "";
 
     let lastPixel = null;
     let selectedPaintColor = null;
@@ -368,6 +401,7 @@
     }
 
     function paletteColorFromElement(el) {
+        const card = el.closest?.(".palette-card");
         for (let node = el; node && node !== document.body; node = node.parentElement) {
             for (const attr of ["data-color", "data-color-index", "data-palette-index", "value", "aria-label", "title"]) {
                 const value = node.getAttribute?.(attr);
@@ -377,6 +411,7 @@
                 const found = PALETTE.find((c) => c.name.toLowerCase() === value.trim().toLowerCase());
                 if (found) return found.index;
             }
+            if (!card || node === card || !/background(?:-color)?\s*:/.test(node.getAttribute?.("style") || "")) continue;
             const match = getComputedStyle(node).backgroundColor.match(/\d+/g);
             if (match?.length >= 3 && (match.length < 4 || Number(match[3]) > 0)) {
                 const color = closestInSet(Number(match[0]), Number(match[1]), Number(match[2]), PALETTE);
@@ -663,7 +698,24 @@
 
     const DOT_SCALE = SHRINK % 2 ? SHRINK : SHRINK + 1;
 
-    const dotFits = (t) => Math.max(t.w, t.h) <= DOT_MAX_DIM / 2;
+    const dotFits = (t) => t.w * t.h <= DOT_FULL_PIXEL_LIMIT;
+    const largeDotTemplate = (t) => !dotFits(t);
+
+    function wrappedPixelDistance(value) {
+        return Math.abs((((value + WORLD_PIXELS / 2) % WORLD_PIXELS) + WORLD_PIXELS) % WORLD_PIXELS - WORLD_PIXELS / 2);
+    }
+
+    function visibleLargeDotTile(tx, ty) {
+        const canvas = map?.getCanvas?.();
+        if (!canvas) return true;
+        const scale = screenPerGlobalPx();
+        const center = map.getCenter();
+        const centerX = lngToGpx(center.lng), centerY = latToGpy(center.lat);
+        const halfW = canvas.clientWidth / (2 * scale) + TILE_SIZE;
+        const halfH = canvas.clientHeight / (2 * scale) + TILE_SIZE;
+        return wrappedPixelDistance(tx * TILE_SIZE + TILE_SIZE / 2 - centerX) <= halfW
+            && Math.abs(ty * TILE_SIZE + TILE_SIZE / 2 - centerY) <= halfH;
+    }
 
     const templateBeforeId = () => map.getLayer("openplace-hover-border") ? "openplace-hover-border" : undefined;
 
@@ -675,7 +727,7 @@
         const a = t._analysis;
         if (errorMode && t.visible && a && a.errorCanvas
             && a.w === t.w && a.h === t.h && a.gx === t.gx && a.gy === t.gy) return "err";
-        if (t.locked && gShrink && z >= DOT_ZOOM && dotFits(t)) return "dots";
+        if (t.locked && gShrink && z >= DOT_ZOOM) return "dots";
         return "filled";
     }
 
@@ -900,6 +952,7 @@
         if (version !== (t._renderVersion || 0)) return;
         const sig = `${t._dotGridSig}|S${S}`;
         const c = Math.floor(S / 2);
+        const limited = largeDotTemplate(t);
 
         const txa = Math.floor(t.gx / TILE_SIZE), txb = Math.floor((t.gx + t.w - 1) / TILE_SIZE);
         const tya = Math.floor(t.gy / TILE_SIZE), tyb = Math.floor((t.gy + t.h - 1) / TILE_SIZE);
@@ -914,6 +967,7 @@
                 const ix1 = Math.min(t.gx + t.w, tileLeft + TILE_SIZE), iy1 = Math.min(t.gy + t.h, tileTop + TILE_SIZE);
                 const ow = ix1 - ix0, oh = iy1 - iy0;
                 if (ow <= 0 || oh <= 0) continue;
+                if (limited && !visibleLargeDotTile(tx, ty)) continue;
                 const key = `${tx}-${ty}`;
                 needed.add(key);
 
@@ -1461,6 +1515,9 @@
         const title = document.createElement("div");
         const subtitle = document.createElement("div");
         const code = document.createElement("div");
+        const preview = document.createElement("div");
+        const previewImage = document.createElement("img");
+        const previewText = document.createElement("div");
         const actions = document.createElement("div");
         const primary = document.createElement("button");
         const close = document.createElement("button");
@@ -1472,12 +1529,15 @@
         const getCode = () => inputs.map((input) => input.value).join("");
         const setReadOnly = (readOnly) => inputs.forEach((input) => { input.readOnly = readOnly; input.tabIndex = readOnly ? -1 : 0; });
         Object.assign(root.style, { position: "fixed", inset: "0", zIndex: "2147483647", display: "none", alignItems: "center", justifyContent: "center", padding: "16px", background: "rgba(0,0,0,.62)" });
-        Object.assign(box.style, { width: "min(430px,100%)", boxSizing: "border-box", display: "flex", flexDirection: "column", alignItems: "stretch", gap: "12px", padding: "20px", border: "1px solid #344150", borderRadius: "14px", background: "#10161c", color: "#eef3f8", font: "13px system-ui,sans-serif", boxShadow: "0 18px 48px #0009" });
+        Object.assign(box.style, { width: "min(480px,100%)", boxSizing: "border-box", display: "flex", flexDirection: "column", alignItems: "stretch", gap: "12px", padding: "20px", border: "1px solid #344150", borderRadius: "14px", background: "#10161c", color: "#eef3f8", font: "13px system-ui,sans-serif", boxShadow: "0 18px 48px #0009" });
         Object.assign(icon.style, { width: "42px", height: "42px", display: "grid", placeItems: "center", alignSelf: "center", border: "1px solid #2e3947", borderRadius: "50%", background: "#131b25" });
         Object.assign(marker.style, { width: "15px", height: "15px", border: "1px dashed #dce6f0", borderRadius: "3px" });
         Object.assign(title.style, { textAlign: "center", fontSize: "16px", fontWeight: "700", marginTop: "2px" });
         Object.assign(subtitle.style, { minHeight: "18px", textAlign: "center", color: "#9eabb9", fontSize: "12px" });
         Object.assign(code.style, { display: "grid", gridTemplateColumns: "repeat(10,minmax(0,1fr))", gap: "5px" });
+        Object.assign(preview.style, { display: "none", gap: "14px", alignItems: "center", padding: "12px", border: "1px solid #2e3947", borderRadius: "9px", background: "#0c1116" });
+        Object.assign(previewImage.style, { width: "112px", height: "112px", objectFit: "contain", borderRadius: "6px", background: "#161d26" });
+        Object.assign(previewText.style, { minWidth: "0", color: "#cbd6e2", fontSize: "12px", lineHeight: "1.45", whiteSpace: "pre-line" });
         for (const [index, input] of inputs.entries()) {
             input.type = "text";
             input.maxLength = 1;
@@ -1490,6 +1550,7 @@
             input.addEventListener("input", () => {
                 input.value = input.value.replace(/[^A-Za-z0-9]/g, "").slice(-1);
                 if (input.value && index < inputs.length - 1) inputs[index + 1].focus();
+                shareDialog?.onCodeChange?.();
             });
             input.addEventListener("keydown", (event) => {
                 if (event.key === "Backspace" && !input.value && index > 0) { inputs[index - 1].focus(); inputs[index - 1].select(); }
@@ -1499,6 +1560,7 @@
                 if (!pasted) return;
                 event.preventDefault();
                 setCode(pasted);
+                shareDialog?.onCodeChange?.();
                 const next = Math.min(getCode().length, inputs.length - 1);
                 inputs[next].focus();
             });
@@ -1508,13 +1570,14 @@
         Object.assign(primary.style, { width: "100%", minHeight: "40px", border: "1px solid #4a82ed", borderRadius: "7px", background: "#477df0", color: "#fff", fontWeight: "650", cursor: "pointer" });
         Object.assign(close.style, { alignSelf: "center", padding: "3px 8px", border: "none", background: "transparent", color: "#9eabb9", fontSize: "11px", cursor: "pointer" });
         icon.appendChild(marker);
+        preview.append(previewImage, previewText);
         root.addEventListener("click", (event) => { if (event.target === root) root.style.display = "none"; });
         close.addEventListener("click", () => { root.style.display = "none"; });
         actions.append(primary, close);
-        box.append(icon, title, subtitle, code, actions);
+        box.append(icon, title, subtitle, code, preview, actions);
         root.appendChild(box);
         document.body.appendChild(root);
-        shareDialog = { root, box, title, subtitle, inputs, primary, close, setCode, getCode, setReadOnly };
+        shareDialog = { root, box, title, subtitle, inputs, primary, close, preview, previewImage, previewText, setCode, getCode, setReadOnly, onCodeChange: null };
         return shareDialog;
     }
 
@@ -1522,6 +1585,8 @@
         const dialog = getShareDialog();
         dialog.title.textContent = "Share template";
         dialog.subtitle.textContent = "Send this 10-character code to another user.";
+        dialog.preview.style.display = "none";
+        dialog.onCodeChange = null;
         dialog.setCode(code);
         dialog.setReadOnly(true);
         dialog.primary.textContent = "Copy share code";
@@ -1532,15 +1597,34 @@
 
     function showImportShareDialog() {
         const dialog = getShareDialog();
+        let pendingShare = null;
+        const resetPreview = () => {
+            pendingShare = null;
+            dialog.preview.style.display = "none";
+            dialog.primary.textContent = "Preview template";
+            dialog.subtitle.textContent = "Enter the 10-character code you received.";
+        };
         dialog.title.textContent = "Import template";
-        dialog.subtitle.textContent = "Enter the 10-character code you received.";
         dialog.setCode("");
         dialog.setReadOnly(false);
-        dialog.primary.textContent = "Import template";
         dialog.close.textContent = "Cancel";
+        dialog.onCodeChange = resetPreview;
+        resetPreview();
         dialog.primary.onclick = async () => {
             try {
-                await importShareCode(dialog.getCode());
+                if (!pendingShare) {
+                    pendingShare = await previewShareCode(dialog.getCode());
+                    const size = `${Math.max(1, Math.round(Number(pendingShare.w) || 0))}×${Math.max(1, Math.round(Number(pendingShare.h) || 0))} px`;
+                    const position = Array.isArray(pendingShare.p) && Number.isFinite(pendingShare.p[0]) && Number.isFinite(pendingShare.p[1]) ? gpToTilePixel(pendingShare.p[0], pendingShare.p[1]) : null;
+                    dialog.previewImage.src = pendingShare.d;
+                    dialog.previewImage.alt = "Shared template preview";
+                    dialog.previewText.textContent = `${String(pendingShare.n || "Shared template").slice(0, 120)}\n${size}${position ? `\nTile ${position.tx}, ${position.ty} · px ${position.px}, ${position.py}` : "\nNo saved location"}`;
+                    dialog.preview.style.display = "flex";
+                    dialog.subtitle.textContent = "Review the shared template before importing.";
+                    dialog.primary.textContent = "Import template";
+                    return;
+                }
+                await importSharedTemplate(pendingShare);
                 dialog.root.style.display = "none";
             } catch (e) {
                 showToast(e?.message || "Could not import this share code.", "error", 7000);
@@ -1553,6 +1637,10 @@
     async function shareTemplate(t) {
         if (!t?.locked) {
             showToast("Lock this template before sharing it.", "info");
+            return;
+        }
+        if (!confirm("Share codes let another person preview and import this locked template at the same map location. Anyone you give the code to can access that shared template. Continue?")) {
+            showToast("Share code cancelled.", "info");
             return;
         }
         showToast("Preparing share code…", "progress", 0);
@@ -1571,9 +1659,17 @@
         }
     }
 
-    async function importShareCode(code) {
+    async function previewShareCode(code) {
         showToast("Reading shared template…", "progress", 0);
-        const shared = await readShareCode(await resolveShareCode(code));
+        return readShareCode(await resolveShareCode(code));
+    }
+
+    async function importShareCode(code) {
+        return importSharedTemplate(await previewShareCode(code));
+    }
+
+    async function importSharedTemplate(shared) {
+        showToast("Importing shared template…", "progress", 0);
         const img = await loadImage(shared.d, "shared template");
         const placement = lastPixel ? [gpxToLng(lastPixel.gx), gpyToLat(lastPixel.gy)] : null;
         const sharedPosition = Array.isArray(shared.p) && Number.isFinite(shared.p[0]) && Number.isFinite(shared.p[1]) ? shared.p : null;
@@ -2004,6 +2100,43 @@
         showToast(statusMsg, kind, ms);
     }
 
+    function announceUpdate() {
+        const previous = lastSeenVersion;
+        lastSeenVersion = SCRIPT_VERSION;
+        saveSettings();
+        if (previous && previous !== SCRIPT_VERSION) showToast(`openplace Template Overlay updated to v${SCRIPT_VERSION}.`, "success", 5000);
+    }
+
+    function showWalkthrough(restart = false) {
+        if (walkthroughSeen && !restart) return;
+        document.querySelector(".rtpl-walk-root")?.remove();
+        const steps = [
+            { title: "Welcome to openplace Template Overlay", text: "This overlay keeps reference images on the map while you paint. It works independently from openplace, and its position, minimized state, and settings are remembered after a refresh." },
+            { title: "Add an image", text: "Select Add image to open the editor. You can also drag and drop an image directly onto the map to start a template at that map location. If you have a pixel selected, importing through the editor uses that pixel as the image’s top-left corner." },
+            { title: "Use the editor", text: "In the editor, import an image with the button, drag and drop an image onto the editor, or paste an image from your clipboard. Adjust its palette, resize it, rotate or flip it, then choose whether to add a new template or replace the source of the template you opened." },
+            { title: "Move the interface", text: "Drag the overlay by its header to place it anywhere on screen. When it is minimized, hold Ctrl while dragging the small button on desktop; on touch devices, touch-drag it. Both positions are saved automatically." },
+            { title: "Position and lock templates", text: "Templates are unlocked while you position them. Turn on Edit mode to drag them or use their handles to resize. Lock the template once it is aligned: locking prevents accidental edits and enables sharing, color counts, selected color mode, Error mode, and Easy Paint." },
+            { title: "Share with a code", text: "Only locked templates can create a share code. Share the code with someone else; they choose Import code, enter it, review the larger preview, and import the same image at the same map location. Imported shared templates stay locked." },
+            { title: "Settings and painting help", text: "Settings contains display options, map scaling, Performance mode, and backup export/import. Easy Paint only paints matching pixels, while Error mode shows progress. Refresh the page after painting before relying on Easy Paint or Error mode results." }
+        ];
+        let step = 0;
+        const root = document.createElement("div");
+        root.className = "rtpl-walk-root";
+        Object.assign(root.style, { position: "fixed", inset: "0", zIndex: "2147483647", display: "grid", placeItems: "center", padding: "16px", background: "rgba(0,0,0,.62)", color: "#eef3f8", font: "13px system-ui,sans-serif" });
+        const box = document.createElement("div");
+        Object.assign(box.style, { width: "min(440px,100%)", boxSizing: "border-box", padding: "22px", border: "1px solid #344150", borderRadius: "14px", background: "#10161c", boxShadow: "0 18px 48px #0009" });
+        const finish = () => { walkthroughSeen = true; saveSettings(); root.remove(); };
+        const render = () => {
+            const current = steps[step];
+            box.innerHTML = `<div style="color:#8fb8ff;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase">Step ${step + 1} of ${steps.length}</div><h2 style="margin:8px 0 10px;font-size:18px">${current.title}</h2><p style="margin:0;color:#c5cfda;line-height:1.55">${current.text}</p><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:22px"><button class="rtpl-walk-back" style="padding:7px 10px;border:1px solid #3a4757;border-radius:7px;background:transparent;color:#cbd6e2;cursor:pointer">${step ? "Back" : "Skip"}</button><button class="rtpl-walk-next" style="padding:7px 14px;border:1px solid #3a86ff;border-radius:7px;background:#3a86ff;color:#fff;cursor:pointer">${step === steps.length - 1 ? "Finish" : "Next"}</button></div>`;
+            box.querySelector(".rtpl-walk-back").addEventListener("click", () => { if (!step) finish(); else { step--; render(); } });
+            box.querySelector(".rtpl-walk-next").addEventListener("click", () => { if (step === steps.length - 1) finish(); else { step++; render(); } });
+        };
+        root.appendChild(box);
+        document.body.appendChild(root);
+        render();
+    }
+
     function buildUI() {
         injectStyles();
 
@@ -2028,7 +2161,7 @@
             <div class="rtpl-top">
                 <div class="rtpl-head">
                     <span>Templates</span>
-                    <button class="rtpl-x" title="Close">✕</button>
+                    <div class="rtpl-head-actions"><button class="rtpl-help" title="Show walkthrough" aria-label="Show walkthrough">?</button><button class="rtpl-x" title="Close">✕</button></div>
                 </div>
                 <div class="rtpl-account" style="display:none"></div>
             </div>
@@ -2080,6 +2213,7 @@
                 <div class="rtpl-globaltoggles">
                     <label title="Show the on-map box and drag handles used to move or resize templates."><input type="checkbox" class="rtpl-edit"> Edit mode</label>
                     <label title="At close map zoom levels, draw each locked template pixel as a small centered dot."><input type="checkbox" class="rtpl-g-shrink"> Small pixels</label>
+                    <label title="Reduces automatic comparison work to help slower devices. Enabled by default on mobile."><input type="checkbox" class="rtpl-g-performance"> Performance mode</label>
                     <label title="Show only the most recently selected openplace palette color on locked templates."><input type="checkbox" class="rtpl-g-selectedcolor"> Selected color mode</label>
                     <label><input type="checkbox" class="rtpl-g-easy"> Easy paint <span class="rtpl-info" tabindex="0" title="Only paint pixels that match the template's colour here; everything else stays as-is. Already-correct pixels are skipped too. Refresh the page after painting to see the proper changes.">?</span></label>
                     <label title="For visible templates, show correct pixels in green, missing pixels in yellow, and wrong pixels in red."><input type="checkbox" class="rtpl-g-err"> Error mode</label>
@@ -2092,6 +2226,7 @@
                         <input type="number" class="rtpl-g-panstep" min="1" max="5000" step="10">
                         <span class="rtpl-muted">px / press</span>
                     </div>
+                    <div class="rtpl-backup"><button class="rtpl-toggle rtpl-backup-export">Export backup</button><button class="rtpl-toggle rtpl-backup-import">Import backup</button><input type="file" accept="application/json,.json" class="rtpl-backup-file" hidden></div>
                 </div>
             </div>
         `;
@@ -2103,6 +2238,7 @@
         updateAccountBar();
 
         panel.querySelector(".rtpl-x").addEventListener("click", () => { panelOpen = false; panel.classList.add("rtpl-hidden"); saveSettings(); });
+        panel.querySelector(".rtpl-help").addEventListener("click", () => showWalkthrough(true));
 
         const settings = panel.querySelector(".rtpl-settings");
         panel.querySelector(".rtpl-settings-head").addEventListener("click", () => {
@@ -2119,6 +2255,17 @@
         panel.querySelector(".rtpl-addimg").addEventListener("click", () => fileInput.click());
         panel.querySelector(".rtpl-openeditor").addEventListener("click", () => openEditor());
         panel.querySelector(".rtpl-importcode").addEventListener("click", showImportShareDialog);
+        const backupInput = panel.querySelector(".rtpl-backup-file");
+        panel.querySelector(".rtpl-backup-export").addEventListener("click", downloadBackup);
+        panel.querySelector(".rtpl-backup-import").addEventListener("click", () => backupInput.click());
+        backupInput.addEventListener("change", async () => {
+            const file = backupInput.files[0];
+            if (file) {
+                try { await importBackup(file); }
+                catch (e) { showToast(e?.message || "Could not import that backup.", "error", 7000); }
+            }
+            backupInput.value = "";
+        });
 
         const tpInput = panel.querySelector(".rtpl-tp-input");
         const doTeleport = () => { if (teleportTo(tpInput.value)) tpInput.blur(); };
@@ -2141,6 +2288,7 @@
 
         const editCb = panel.querySelector(".rtpl-edit");
         const shrinkCb = panel.querySelector(".rtpl-g-shrink");
+        const performanceCb = panel.querySelector(".rtpl-g-performance");
         const selectedColorCb = panel.querySelector(".rtpl-g-selectedcolor");
         const easyCb = panel.querySelector(".rtpl-g-easy");
         const errCb = panel.querySelector(".rtpl-g-err");
@@ -2148,6 +2296,7 @@
         const outlineBtn = panel.querySelector(".rtpl-g-outline");
         editCb.checked = editMode;
         shrinkCb.checked = gShrink;
+        performanceCb.checked = performanceMode;
         selectedColorCb.checked = gSelectedColorMode;
         easyCb.checked = gEasyPaint;
         errCb.checked = errorMode;
@@ -2161,6 +2310,12 @@
         shrinkCb.addEventListener("change", async (e) => {
             gShrink = e.target.checked; saveSettings();
             await applyGlobalDisplayChange();
+        });
+        performanceCb.addEventListener("change", (e) => {
+            performanceMode = e.target.checked;
+            saveSettings();
+            if (!performanceMode) autoAnalyzeTick();
+            showToast(performanceMode ? "Performance mode enabled." : "Performance mode disabled.", "success");
         });
         selectedColorCb.addEventListener("change", async (e) => {
             if (e.target.checked && selectedPaintColor == null) {
@@ -2225,13 +2380,12 @@
     async function setErrorMode(on) {
         errorMode = on; saveSettings();
         if (on) {
-            setStatus("Comparing templates with canvas…", "progress", 0);
-            for (const t of templates) {
-                if (t.visible && !t._analysis) {
-                    try { await analyzeTemplate(t); } catch (e) { LOG("analysis failed", e); }
-                }
+            const pending = templates.filter((t) => t.visible && !t._analysis);
+            for (let index = 0; index < pending.length; index++) {
+                setStatus(`Comparing template ${index + 1} of ${pending.length}…`, "progress", 0);
+                try { await analyzeTemplate(pending[index]); } catch (e) { LOG("analysis failed", e); }
             }
-            setStatus("");
+            if (pending.length) setStatus(`Compared ${pending.length} template${pending.length === 1 ? "" : "s"}.`, "success", 2500);
         }
         for (const t of templates) await updateTemplateTiles(t);
         renderPanel();
@@ -2485,7 +2639,7 @@
                         <input class="rtpl-name" value="${escapeHtml(t.name)}">
                         <div class="rtpl-dim">${t.w}×${t.h}px · tile ${tx},${ty} px ${px},${py}</div>
                     </div>
-                    <button class="rtpl-icon rtpl-edit-img" title="Edit / dither image">✏️</button>
+                    ${t.locked ? "" : `<button class="rtpl-icon rtpl-edit-img" title="Edit / dither image">✏️</button>`}
                     <button class="rtpl-icon rtpl-go" title="Go to template">📍</button>
                     <button class="rtpl-icon rtpl-del" title="Delete">🗑️</button>
                 </div>
@@ -2497,14 +2651,11 @@
                 <div class="rtpl-collapsible">
                     <div class="rtpl-row3">
                         <button class="rtpl-toggle rtpl-lock">${t.locked ? "Unlock" : "Lock"}</button>
-                        ${t.locked ? "" : `
+                        ${t.locked ? `<button class="rtpl-toggle rtpl-share">Share code</button>` : `
                         <button class="rtpl-toggle rtpl-ar">${t.aspectLock ? "Ratio" : "Free resize"}</button>
                         <button class="rtpl-toggle rtpl-one">1:1 size</button>
                         `}
-                    </div>${t.locked ? `
-                    <div class="rtpl-coordstr">tX: ${tx}  tY: ${ty}  X: ${px}  Y: ${py}</div>
-                    <div class="rtpl-row3"><button class="rtpl-toggle rtpl-share">Share code</button></div>
-                    ` : `
+                    </div>${t.locked ? "" : `
                     <div class="rtpl-row3">
                         <label class="rtpl-num">X tile<input type="number" class="rtpl-tx" value="${tx}"></label>
                         <label class="rtpl-num">Y tile<input type="number" class="rtpl-ty" value="${ty}"></label>
@@ -2522,7 +2673,7 @@
             `;
 
             card.addEventListener("pointerdown", (e) => {
-                if (e.target.closest("input,button,select,.rtpl-dim,.rtpl-coordstr,.rtpl-drag")) return;
+                if (e.target.closest("input,button,select,.rtpl-dim,.rtpl-drag")) return;
                 selectedId = t.id; renderPanel(); updateOverlay();
             });
 
@@ -2538,13 +2689,13 @@
             card.querySelector(".rtpl-go").addEventListener("click", () => goToTemplate(t));
             card.querySelector(".rtpl-share")?.addEventListener("click", () => shareTemplate(t));
 
-            for (const sel of [".rtpl-dim", ".rtpl-coordstr"]) {
+            for (const sel of [".rtpl-dim"]) {
                 const el = card.querySelector(sel);
                 if (!el) continue;
                 el.title = "Click to copy coordinates";
                 el.addEventListener("click", (e) => { e.stopPropagation(); copyTemplateCoords(t); });
             }
-            card.querySelector(".rtpl-edit-img").addEventListener("click", () => {
+            card.querySelector(".rtpl-edit-img")?.addEventListener("click", () => {
                 openEditor();
                 editorSetSource(t.dataUrl, t.name, t.id);
             });
@@ -2648,6 +2799,7 @@
     const cardOf = (t) => panelBody?.querySelector(`[data-card="${t.id}"]`) || null;
     function needsAnalysis(t) {
         if (t.w * t.h > AUTO_MAX_PIXELS) return false;
+        if (performanceMode && !gEasyPaint && !errorMode) return false;
         if (errorMode && t.visible) return true;
 
         if (gEasyPaint && t.visible) return true;
@@ -2889,7 +3041,7 @@
         .rtpl-panel.rtpl-hidden{display:none}
         .rtpl-head{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;
             background:#22272e;border-bottom:1px solid #333;font-weight:600;border-radius:10px 10px 0 0;position:sticky;top:0}
-        .rtpl-x{background:none;border:none;color:#aaa;cursor:pointer;font-size:14px}
+        .rtpl-head-actions{display:flex;align-items:center;gap:9px}.rtpl-help{width:19px;height:19px;padding:0;border:1px solid #526171;border-radius:50%;background:transparent;color:#cbd6e2;cursor:pointer;font-size:12px;line-height:17px}.rtpl-x{background:none;border:none;color:#aaa;cursor:pointer;font-size:14px}
         .rtpl-actions{padding:10px 12px 4px}
         .rtpl-add{width:100%;padding:8px;border:1px dashed #4a7bd6;background:#1f2630;color:#cfe0ff;border-radius:8px;cursor:pointer}
         .rtpl-add:hover{background:#243044}
@@ -2939,8 +3091,6 @@
         .rtpl-toggle:disabled{opacity:.4;cursor:not-allowed}
         .rtpl-num{flex:1;display:flex;flex-direction:column;color:#8a93a0;font-size:10px;gap:2px}
         .rtpl-num input{background:#161a1f;border:1px solid #2c333d;color:#fff;border-radius:4px;padding:3px 4px;width:100%}
-        .rtpl-coordstr{margin-top:6px;padding:5px 8px;background:#161a1f;border:1px solid #2c333d;border-radius:6px;color:#cdd3dc;font:11px ui-monospace,monospace;letter-spacing:.3px;cursor:pointer}
-        .rtpl-coordstr:hover{border-color:#3a86ff;color:#fff}
         .rtpl-drophint{position:fixed;inset:0;z-index:10050;display:flex;align-items:center;justify-content:center;
             background:rgba(58,134,255,.12);border:3px dashed #3a86ff;color:#fff;font:600 22px system-ui;pointer-events:none}
         .rtpl-toggle.rtpl-active{background:#3a86ff;color:#fff;border-color:#3a86ff}
@@ -2964,6 +3114,8 @@
         .rtpl-dl-collapsed .rtpl-dl-body{display:none}
         .rtpl-dlout{display:flex;gap:6px;align-items:center;color:#bbb;font-size:12px;margin-bottom:6px;cursor:pointer}
         .rtpl-dl-go{margin-top:8px}
+        .rtpl-backup{display:flex;gap:6px;margin-top:4px}
+        .rtpl-backup .rtpl-toggle{min-height:34px}
 
         .rtpl-tpl{border-top:1px solid #333;padding-top:4px}
         .rtpl-tpl-head{display:flex;align-items:center;gap:6px;padding:6px 12px;cursor:pointer;user-select:none;color:#cdd3dc;font-weight:600}
@@ -2998,6 +3150,8 @@
         .rtpl-ed-palchk{flex:0 0 auto;color:#37d67a;font-weight:700;visibility:hidden}
         .rtpl-ed-palcell.rtpl-on .rtpl-ed-palchk{visibility:visible}
         .rtpl-ed-resize{display:flex;gap:6px;align-items:flex-end}
+        .rtpl-ed-transform{display:flex;gap:6px;align-items:flex-end;flex-wrap:wrap}
+        .rtpl-ed-transform .rtpl-toggle{flex:0 0 auto;min-width:34px;font-size:16px}
         .rtpl-ed-resize .rtpl-ed-w,.rtpl-ed-resize .rtpl-ed-h{width:62px}
         .rtpl-ed-x{color:#8a93a0;padding-bottom:6px}
         .rtpl-ed-lockaspect{display:flex;gap:4px;align-items:center;color:#aab2bd;font-size:11px;padding-bottom:5px}
@@ -3080,6 +3234,8 @@
             .rtpl-ed-ctl select,.rtpl-ed-ctl input{width:100%;box-sizing:border-box}
             .rtpl-ed-import,.rtpl-ed-palbtn,.rtpl-ed-view{width:100%;min-height:36px}
             .rtpl-ed-preset-save,.rtpl-ed-preset-del{align-self:stretch;padding:5px}
+            .rtpl-ed-transform{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+            .rtpl-ed-transform .rtpl-toggle{min-width:0;white-space:normal;line-height:1.15;padding:6px 4px}
             .rtpl-ed-resize{grid-column:1/-1;flex-wrap:wrap;gap:6px}
             .rtpl-ed-resize .rtpl-ed-ctl{flex:1 1 calc(50% - 3px)}
             .rtpl-ed-resize .rtpl-ed-w,.rtpl-ed-resize .rtpl-ed-h{width:100%}
@@ -3258,6 +3414,7 @@
             <div class="rtpl-ed-controls">
                 <button class="rtpl-add rtpl-ed-import">Import image…</button>
                 <input type="file" accept="image/*" class="rtpl-ed-file" hidden>
+                <div class="rtpl-ed-transform"><button class="rtpl-toggle rtpl-ed-rotate-l" title="Rotate left" aria-label="Rotate left">↶</button><button class="rtpl-toggle rtpl-ed-rotate-r" title="Rotate right" aria-label="Rotate right">↷</button><button class="rtpl-toggle rtpl-ed-flip-h" title="Flip horizontally" aria-label="Flip horizontally">⇄</button><button class="rtpl-toggle rtpl-ed-flip-v" title="Flip vertically" aria-label="Flip vertically">⇅</button></div>
                 <label class="rtpl-ed-ctl">Preset
                     <select class="rtpl-ed-preset"></select>
                 </label>
@@ -3311,6 +3468,10 @@
         });
         const fileInput = editor.querySelector(".rtpl-ed-file");
         editor.querySelector(".rtpl-ed-import").addEventListener("click", () => fileInput.click());
+        editor.querySelector(".rtpl-ed-rotate-l").addEventListener("click", () => editorTransform("rotate-left"));
+        editor.querySelector(".rtpl-ed-rotate-r").addEventListener("click", () => editorTransform("rotate-right"));
+        editor.querySelector(".rtpl-ed-flip-h").addEventListener("click", () => editorTransform("flip-horizontal"));
+        editor.querySelector(".rtpl-ed-flip-v").addEventListener("click", () => editorTransform("flip-vertical"));
 
         editor.querySelector(".rtpl-ed-empty").addEventListener("click", () => { if (!editorState) fileInput.click(); });
         fileInput.addEventListener("change", async (e) => {
@@ -3465,6 +3626,35 @@
         stage.addEventListener("pointerdown", (e) => { if (editorView === "slider" && e.target !== handle && !handle.contains(e.target)) { dragging = true; setFromClient(e.clientX); } });
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
+    }
+
+    async function editorTransform(type) {
+        if (!editorState) return;
+        const source = editorState.srcImg;
+        const name = editorState.name;
+        const templateId = editorState.templateId;
+        const canvas = document.createElement("canvas");
+        const turn = type === "rotate-left" || type === "rotate-right";
+        canvas.width = turn ? source.naturalHeight : source.naturalWidth;
+        canvas.height = turn ? source.naturalWidth : source.naturalHeight;
+        showEditorLoading(true);
+        showToast("Transforming image…", "progress", 0);
+        try {
+            const ctx = canvas.getContext("2d");
+            if (type === "rotate-left") { ctx.translate(0, canvas.height); ctx.rotate(-Math.PI / 2); }
+            if (type === "rotate-right") { ctx.translate(canvas.width, 0); ctx.rotate(Math.PI / 2); }
+            if (type === "flip-horizontal") { ctx.translate(canvas.width, 0); ctx.scale(-1, 1); }
+            if (type === "flip-vertical") { ctx.translate(0, canvas.height); ctx.scale(1, -1); }
+            ctx.drawImage(source, 0, 0);
+            const dataUrl = canvas.toDataURL("image/png");
+            const image = await loadImage(dataUrl, name || "image");
+            await editorSetSource(dataUrl, name, templateId, image);
+            showToast("Image transformed.", "success");
+        } catch (e) {
+            LOG("editor transform failed", e);
+            showEditorLoading(false);
+            showToast("Could not transform this image.", "error", 7000);
+        }
     }
 
     function editorDownload() {
@@ -3788,16 +3978,34 @@
         });
     }
 
+    let deferredLayerRenderToken = 0;
+    const deferLayerRender = (fn) => {
+        if (typeof requestIdleCallback === "function") requestIdleCallback(fn, { timeout: 250 });
+        else setTimeout(fn, 40);
+    };
+
     async function reAddAllLayers() {
         if (!map) return;
+        const token = ++deferredLayerRenderToken;
+        const deferred = [];
         for (const t of templates) {
-
             t._tiles = new Map();
             t._dotTiles = new Map();
-            await updateTemplateTiles(t);
+            if (largeDotTemplate(t)) deferred.push(t);
+            else await updateTemplateTiles(t);
         }
+        if (!deferred.length) return;
+        let index = 0;
+        const renderNext = async () => {
+            if (!map || token !== deferredLayerRenderToken) return;
+            const t = deferred[index++];
+            showToast(`Loading large template ${index} of ${deferred.length}…`, "progress", 0);
+            try { await updateTemplateTiles(t); } catch (e) { LOG("large template render failed", e); }
+            if (index < deferred.length) deferLayerRender(renderNext);
+            else showToast("Large templates loaded.", "success", 3000);
+        };
+        deferLayerRender(renderNext);
     }
-
     async function init() {
 
         await loadSettings();
@@ -3836,6 +4044,8 @@
         await whenStyleReady(map);
         LOG("map ready");
         setStatus("");
+        announceUpdate();
+        showWalkthrough();
 
         buildOverlay();
         attachPickHandler();
@@ -3850,10 +4060,16 @@
         setInterval(autoAnalyzeTick, AUTO_INTERVAL);
         autoAnalyzeTick();
 
-        let zoomDebounce = null;
+        let zoomDebounce = null, largeDotMoveDebounce = null;
         map.on("zoom", () => {
             clearTimeout(zoomDebounce);
             zoomDebounce = setTimeout(refreshTemplateModes, 120);
+        });
+        map.on("moveend", () => {
+            clearTimeout(largeDotMoveDebounce);
+            largeDotMoveDebounce = setTimeout(() => {
+                for (const t of templates) if (t._mode === "dots" && largeDotTemplate(t)) queueTemplateRender(t);
+            }, 100);
         });
 
         map.on("style.load", () => { reAddAllLayers().then(updateOverlay); });
