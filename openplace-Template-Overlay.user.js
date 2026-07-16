@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.8.5
+// @version      1.8.6
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -33,8 +33,9 @@
     const SCALE_ALGORITHMS = [["nearest","Nearest-neighbor (crisp)"],["low","Smooth — low quality"],["medium","Smooth — medium quality"],["high","Smooth — high quality"]];
 
     const LOG = (...a) => console.log("%c[Template]", "color:#3a86ff", ...a);
-    const SCRIPT_VERSION = "1.8.5";
+    const SCRIPT_VERSION = "1.8.6";
     const CHANGELOG = [
+        { version: "1.8.6", changes: [["Fixed", "Overlay handle artifact."], ["Fixed", "Charge status accuracy."]] },
         { version: "1.8.5", changes: [["Reworked", "Walkthrough keyboard guidance."]] },
         { version: "1.8.4", changes: [["Removed", "Edit mode setting."], ["Reworked", "Unlocked templates are always editable."], ["Reworked", "Archived template actions."]] },
         { version: "1.8.3", changes: [["Fixed", "Ruler import error."]] },
@@ -127,7 +128,8 @@
         return location.origin;
     };
 
-    const me = { droplets: null, charges: null, max: null, cooldownMs: null, syncAt: 0 };
+    const me = { droplets: null, charges: null, max: null, cooldownMs: null };
+    let accountRefreshTimer = null;
 
     async function fetchUserColors() {
         try {
@@ -142,17 +144,18 @@
                 me.charges = u.charges.count;
                 me.max = u.charges.max;
                 me.cooldownMs = u.charges.cooldownMs;
-                me.syncAt = Date.now();
             }
             userFetched = true;
             updateAccountBar();
         } catch (e) {  }
     }
 
-    function estimatedCharges() {
-        if (me.charges == null || me.max == null || !me.cooldownMs) return me.charges;
-        const gained = (Date.now() - me.syncAt) / me.cooldownMs;
-        return Math.min(me.max, me.charges + gained);
+    function queueAccountRefresh(delay = 700) {
+        clearTimeout(accountRefreshTimer);
+        accountRefreshTimer = setTimeout(() => {
+            accountRefreshTimer = null;
+            fetchUserColors();
+        }, delay);
     }
 
     const fmtDuration = (ms) => {
@@ -166,7 +169,7 @@
         if (!accountBarEl) return;
         if (me.charges == null) { accountBarEl.style.display = "none"; return; }
         accountBarEl.style.display = "flex";
-        const cur = estimatedCharges();
+        const cur = Math.min(me.max, Math.max(0, Math.floor(me.charges)));
         const full = (me.max - cur) * me.cooldownMs;
         accountBarEl.innerHTML =
             `<span title="Droplets">💧 ${me.droplets != null ? me.droplets.toLocaleString() : "—"}</span>` +
@@ -1899,7 +1902,7 @@
         overlayRoot = document.createElement("div");
         overlayRoot.className = "rtpl-overlay";
         Object.assign(overlayRoot.style, {
-            position: "absolute", inset: "0", pointerEvents: "none", zIndex: 5
+            position: "absolute", inset: "0", pointerEvents: "none", zIndex: 5, display: "none"
         });
 
         svg = document.createElementNS(SVGNS, "svg");
@@ -1949,6 +1952,8 @@
             r.setAttribute("stroke", "#3a86ff");
             r.setAttribute("stroke-width", "2");
             r.dataset.handle = def.id;
+            r.style.display = "none";
+            r.style.pointerEvents = "none";
             r.style.cursor = handleCursor(def.id);
             r.style.touchAction = "none";
             svg.appendChild(r);
@@ -2716,6 +2721,7 @@
             const gy = Math.floor(latToGpy(e.lngLat.lat));
 
             lastPixel = { gx, gy };
+            queueAccountRefresh();
             if (rulerMode) {
                 if (!rulerStart) {
                     rulerStart = [gx, gy];
@@ -4426,7 +4432,7 @@
         updateOverlay();
 
         fetchUserColors();
-        setInterval(fetchUserColors, 60_000);
+        setInterval(fetchUserColors, 10_000);
         setInterval(updateAccountBar, 1000);
 
         setInterval(autoAnalyzeTick, AUTO_INTERVAL);
