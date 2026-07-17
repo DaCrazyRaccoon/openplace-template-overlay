@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.8.7
+// @version      1.8.8
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -33,8 +33,9 @@
     const SCALE_ALGORITHMS = [["nearest","Nearest-neighbor (crisp)"],["low","Smooth — low quality"],["medium","Smooth — medium quality"],["high","Smooth — high quality"]];
 
     const LOG = (...a) => console.log("%c[Template]", "color:#3a86ff", ...a);
-    const SCRIPT_VERSION = "1.8.7";
+    const SCRIPT_VERSION = "1.8.8";
     const CHANGELOG = [
+        { version: "1.8.8", changes: [["Fixed", "Live charge maximum parsing."]] },
         { version: "1.8.7", changes: [["Fixed", "Live charge status synchronization."]] },
         { version: "1.8.6", changes: [["Fixed", "Overlay handle artifact."], ["Fixed", "Charge status accuracy."]] },
         { version: "1.8.5", changes: [["Reworked", "Walkthrough keyboard guidance."]] },
@@ -167,7 +168,10 @@
     }
 
     function syncLiveChargeStatus() {
-        const text = document.querySelector(".paint-button")?.textContent || "";
+        const button = document.querySelector(".paint-button");
+        const countdown = button?.querySelector(".paint-button-time")?.textContent || "";
+        const buttonText = button?.textContent || "";
+        const text = countdown && buttonText.endsWith(countdown) ? buttonText.slice(0, -countdown.length) : buttonText;
         const match = text.match(/\bPaint\s+([\d,]+)\s*\/\s*([\d,]+)/i);
         if (!match) return false;
         const charges = Number(match[1].replace(/,/g, ""));
