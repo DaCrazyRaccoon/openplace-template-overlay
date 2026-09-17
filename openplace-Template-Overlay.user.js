@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.11.2
+// @version      1.11.3
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -33,8 +33,9 @@
     const SCALE_ALGORITHMS = [["nearest","Nearest-neighbor (crisp)"],["low","Smooth — low quality"],["medium","Smooth — medium quality"],["high","Smooth — high quality"]];
 
     const LOG = (...a) => console.log("%c[Template]", "color:#3a86ff", ...a);
-    const SCRIPT_VERSION = "1.11.2";
+    const SCRIPT_VERSION = "1.11.3";
     const CHANGELOG = [
+        { version: "1.11.3", changes: [["Added", "Settings: the missing-pixel limit for the color list's 📍 button is adjustable (1–1000, default 100)."], ["Changed", "📍 cycles through the color's missing pixels from the top-left in reading order; Shift+click steps back, Ctrl+click (or Alt/Cmd+click on macOS) restarts at the first."]] },
         { version: "1.11.2", changes: [["Fixed", "Clicking a favourite pin selects its pixel for the overlay too: Copy coordinates, Use selected pixel and image drops use the pin instead of the previous map click (or none)."]] },
         { version: "1.11.1", changes: [["Changed", "Internal clean-up only: the template signature is computed in one place."]] },
         { version: "1.11.0", changes: [["Changed", "Tile checks reuse the browser cache (304s), run in parallel and are shared between templates; in the app the overlay no longer polls the account every 10 s."], ["Changed", "Template colour matching is computed once per template instead of on every check; dot layers only render on-screen tiles; zoom no longer rebuilds the layers."], ["Fixed", "Templates render below the paint preview and the pixel selection in the app; the colour list follows the app's palette; the overlay survives navigating away from the map and back."], ["Fixed", "A full browser storage now shows a warning instead of silently losing templates; a failed backup import says so."], ["Fixed", "+, - and digit hotkeys reach the map when no template is selected; resize keeps the template inside the world; new templates get the right number; reordering over the archive no longer throws."]] },
@@ -391,7 +392,7 @@
         saveTimer = setTimeout(() => rawSet(STORE_KEY, JSON.stringify(templates.map(serialize))), 400);
     }
 
-    const settingsSnapshot = () => ({ errorMode, gOutlineMode, gShrink, gEasyPaint, gHideCompleted, dlOutline, gPanStep, gColorSort, gMapScaleAlgorithm, gEditorScaleAlgorithm, gSelectedColorMode, selectedPaintColor, archiveExpanded, panelPosition, fabPosition, panelOpen, performanceMode, walkthroughSeen, lastSeenVersion, uiTheme });
+    const settingsSnapshot = () => ({ errorMode, gOutlineMode, gShrink, gEasyPaint, gHideCompleted, dlOutline, gPanStep, gTeleportCap, gColorSort, gMapScaleAlgorithm, gEditorScaleAlgorithm, gSelectedColorMode, selectedPaintColor, archiveExpanded, panelPosition, fabPosition, panelOpen, performanceMode, walkthroughSeen, lastSeenVersion, uiTheme });
     function saveSettings() {
         rawSet(SETTINGS_KEY, JSON.stringify(settingsSnapshot()));
     }
@@ -409,6 +410,7 @@
             if (typeof s.gHideCompleted === "boolean") gHideCompleted = s.gHideCompleted;
             if (typeof s.dlOutline === "boolean") dlOutline = s.dlOutline;
             if (typeof s.gPanStep === "number" && s.gPanStep > 0) gPanStep = s.gPanStep;
+            if (Number.isFinite(s.gTeleportCap)) gTeleportCap = clamp(Math.trunc(s.gTeleportCap), 1, 1000);
             if (["count", "countAsc", "missing", "missingAsc", "id", "name"].includes(s.gColorSort)) gColorSort = s.gColorSort;
             if (SCALE_ALGORITHMS.some(([v]) => v === s.gMapScaleAlgorithm)) gMapScaleAlgorithm = s.gMapScaleAlgorithm;
             if (SCALE_ALGORITHMS.some(([v]) => v === s.gEditorScaleAlgorithm)) gEditorScaleAlgorithm = s.gEditorScaleAlgorithm;
@@ -494,6 +496,8 @@
     let gEasyPaint = false;
     let gHideCompleted = false;
     let gPanStep = 150;
+    // Missing-pixel limit for the color list's 📍 button (1–1000).
+    let gTeleportCap = 100;
     let gColorSort = "count";
 
     let gMapScaleAlgorithm = "high", gEditorScaleAlgorithm = "high";
@@ -2724,6 +2728,10 @@
                         <button class="rtpl-toggle rtpl-g-outline"></button>
                     </div>
                     <div class="rtpl-g-cmrow">Map resize sampling <select class="rtpl-g-scale"></select></div>
+                    <div class="rtpl-g-cmrow" title="The color list's 📍 button works while at most this many pixels of the color are missing. Click steps through the missing pixels from the top-left; Shift+click steps back; Ctrl+click, Alt+click or Cmd+click restarts.">📍 limit
+                        <input type="number" class="rtpl-g-tpcap" min="1" max="1000" step="10">
+                        <span class="rtpl-muted">missing px max</span>
+                    </div>
                     ${EMBEDDED ? "" : `
                     <div class="rtpl-g-cmrow"><button class="rtpl-toggle rtpl-ruler" title="Measure the pixel distance between two map clicks">Ruler</button></div>
                     <div class="rtpl-g-cmrow">WASD pan step
@@ -2907,6 +2915,17 @@
             for (const t of templates) resetTemplateCaches(t);
             showToast(`Map resize sampling: ${mapScale.selectedOptions[0].textContent}`, "success");
             await applyGlobalDisplayChange();
+        });
+        const tpCapIn = panel.querySelector(".rtpl-g-tpcap");
+        tpCapIn.value = gTeleportCap;
+        tpCapIn.addEventListener("change", (e) => {
+            const v = parseInt(e.target.value);
+            if (v > 0) {
+                gTeleportCap = clamp(v, 1, 1000);
+                saveSettings();
+                for (const t of templates) applyAnalysisToCard(t, cardOf(t));
+            }
+            tpCapIn.value = gTeleportCap;
         });
         const panstepIn = panel.querySelector(".rtpl-g-panstep");
         if (panstepIn) {
@@ -3618,47 +3637,57 @@
             : `<span class="rtpl-muted">Comparing…</span>`;
     };
 
-    // "Go to nearest missing pixel" is only offered for near-finished colors:
-    // scanning/teleporting through thousands of gaps helps nobody.
-    const TELEPORT_MISSING_CAP = 100;
-
+    // "Go to missing pixel" is only offered for near-finished colors (the
+    // limit is the "📍 limit" setting): stepping through thousands of gaps
+    // helps nobody.
     function setTeleportState(btn, pc, remaining, colorEnabled) {
-        let title = "Go to the nearest missing pixel of this color";
+        let title = "Go to the next missing pixel of this color (Shift+click: previous, Ctrl+click or Alt+click: first)";
         let enabled = false;
         if (!colorEnabled) title = "Enable the color first";
         else if (!pc) title = "Waiting for the next comparison";
         else if (remaining === 0) title = "Color complete — nothing missing";
-        else if (remaining >= TELEPORT_MISSING_CAP) title = `Unlocks when fewer than ${TELEPORT_MISSING_CAP} pixels are left`;
+        else if (remaining > gTeleportCap) title = `Unlocks when at most ${gTeleportCap} pixels are left (📍 limit in settings)`;
         else enabled = true;
         btn.disabled = !enabled;
         btn.title = title;
     }
 
-    function nearestMissingForColor(t, colorIndex) {
+    /**
+     * Step through a color's missing pixels in reading order (top-left to
+     * bottom-right). dir: 1 = next, -1 = previous, 0 = restart at the first.
+     * The cursor lives on the template as the pixel index last visited, so a
+     * fresh comparison (which drops pixels painted meanwhile) keeps the
+     * position: "next" is simply the first gap after it.
+     * Returns { gx, gy, at, count } or null.
+     */
+    function stepMissingForColor(t, colorIndex, dir) {
         const a = t._analysis;
         if (!a || !map) return null;
         const { target, correct, gx, gy, w } = a;
-        // remaining < 100 is enforced by the button state; the cap here only
-        // guards against a stale row acting on a fresher, larger analysis.
+        // remaining <= limit is enforced by the button state; the check here
+        // only guards against a stale row acting on a fresher, larger analysis.
         const candidates = [];
         for (let p = 0; p < target.length; p++) {
             if (target[p] === colorIndex && !correct[p]) {
-                if (candidates.length >= TELEPORT_MISSING_CAP) return null;
+                if (candidates.length >= gTeleportCap) return null;
                 candidates.push(p);
             }
         }
         if (!candidates.length) return null;
-        const c = map.getCenter();
-        const cx = lngToGpx(c.lng), cy = latToGpy(c.lat);
-        let best = null, bestD = Infinity;
-        for (const p of candidates) {
-            const px = gx + (p % w), py = gy + Math.floor(p / w);
-            const dx = wrappedPixelDistance(px + 0.5 - cx);
-            const dy = py + 0.5 - cy;
-            const d = dx * dx + dy * dy;
-            if (d < bestD) { bestD = d; best = { gx: px, gy: py }; }
+        const cursor = t._tpCursor && t._tpCursor.color === colorIndex ? t._tpCursor.p : null;
+        let at = 0;
+        if (dir === 0 || cursor == null) at = dir === -1 ? candidates.length - 1 : 0;
+        else if (dir === 1) {
+            at = candidates.findIndex((p) => p > cursor);
+            if (at < 0) at = 0; // past the last one: wrap to the first
+        } else {
+            at = candidates.length - 1;
+            while (at >= 0 && candidates[at] >= cursor) at--;
+            if (at < 0) at = candidates.length - 1; // before the first one: wrap to the last
         }
-        return best;
+        const p = candidates[at];
+        t._tpCursor = { color: colorIndex, p };
+        return { gx: gx + (p % w), gy: gy + Math.floor(p / w), at: at + 1, count: candidates.length };
     }
 
     function applyAnalysisToCard(t, card) {
@@ -3760,9 +3789,11 @@
                 // The row is a <label> — keep the click off the checkbox.
                 e.preventDefault();
                 e.stopPropagation();
-                const spot = nearestMissingForColor(t, u.index);
+                const dir = (e.ctrlKey || e.altKey || e.metaKey) ? 0 : e.shiftKey ? -1 : 1; // Alt/Cmd: macOS-friendly restart (Ctrl+click opens the context menu there)
+                const spot = stepMissingForColor(t, u.index, dir);
                 if (!spot) { setStatus("No missing pixel of that color found right now.", "error", 4000); return; }
                 teleportToGp(spot.gx, spot.gy);
+                setStatus(`Missing ${u.name} pixel ${spot.at} of ${spot.count} — Shift+click: previous, Ctrl+click or Alt+click: first`, "info", 3000);
             });
 
             row.querySelector("input").addEventListener("change", async (e) => {
@@ -3913,7 +3944,7 @@
         .rtpl-info{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid #708096;border-radius:50%;color:#b8c3d1;font-size:10px;font-weight:700;line-height:1;cursor:help}
         .rtpl-info:hover,.rtpl-info:focus{color:#fff;border-color:#fff;outline:none}
         .rtpl-g-cmrow{display:flex;gap:8px;align-items:center}
-        .rtpl-g-panstep{flex:0 0 auto;width:64px;background:#161a1f;border:1px solid #2c333d;color:#fff;border-radius:4px;padding:3px 5px}
+        .rtpl-g-panstep,.rtpl-g-tpcap{flex:0 0 auto;width:64px;background:#161a1f;border:1px solid #2c333d;color:#fff;border-radius:4px;padding:3px 5px}
         .rtpl-hint{padding:4px 12px 8px;color:#8a93a0;font-size:11px;line-height:1.4}
 
         .rtpl-list{padding:0 12px 12px;display:flex;flex-direction:column;gap:10px}        .rtpl-archive-head{margin:0 10px 8px;padding:7px 9px;border:1px solid #344150;border-radius:7px;background:#18212a;color:#d9e3ed;cursor:pointer;text-align:left;font-size:11px}
@@ -4066,7 +4097,7 @@
         .rtpl-panel .rtpl-op{font-size:11px;color:#94a2b2}
         .rtpl-panel .rtpl-toggle,.rtpl-panel .rtpl-cl-actions button{background:#18212a;border-color:#344150;color:#d9e3ed;border-radius:7px}
         .rtpl-panel .rtpl-toggle:hover,.rtpl-panel .rtpl-cl-actions button:hover{background:#222d38}
-        .rtpl-panel .rtpl-num input,.rtpl-panel .rtpl-g-panstep,.rtpl-panel .rtpl-g-scale{background:#0c1116;border-color:#2d3946;border-radius:6px;color:#e7edf5}
+        .rtpl-panel .rtpl-num input,.rtpl-panel .rtpl-g-panstep,.rtpl-panel .rtpl-g-tpcap,.rtpl-panel .rtpl-g-scale{background:#0c1116;border-color:#2d3946;border-radius:6px;color:#e7edf5}
         .rtpl-panel .rtpl-g-scale{min-width:0;flex:1;padding:4px 6px}
 
         .rtpl-panel .rtpl-info{border-color:#617388;color:#d1dbe6}
