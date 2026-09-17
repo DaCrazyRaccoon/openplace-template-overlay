@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.8.8
+// @version      1.11.2
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -33,8 +33,15 @@
     const SCALE_ALGORITHMS = [["nearest","Nearest-neighbor (crisp)"],["low","Smooth — low quality"],["medium","Smooth — medium quality"],["high","Smooth — high quality"]];
 
     const LOG = (...a) => console.log("%c[Template]", "color:#3a86ff", ...a);
-    const SCRIPT_VERSION = "1.8.8";
+    const SCRIPT_VERSION = "1.11.2";
     const CHANGELOG = [
+        { version: "1.11.2", changes: [["Fixed", "Clicking a favourite pin selects its pixel for the overlay too: Copy coordinates, Use selected pixel and image drops use the pin instead of the previous map click (or none)."]] },
+        { version: "1.11.1", changes: [["Changed", "Internal clean-up only: the template signature is computed in one place."]] },
+        { version: "1.11.0", changes: [["Changed", "Tile checks reuse the browser cache (304s), run in parallel and are shared between templates; in the app the overlay no longer polls the account every 10 s."], ["Changed", "Template colour matching is computed once per template instead of on every check; dot layers only render on-screen tiles; zoom no longer rebuilds the layers."], ["Fixed", "Templates render below the paint preview and the pixel selection in the app; the colour list follows the app's palette; the overlay survives navigating away from the map and back."], ["Fixed", "A full browser storage now shows a warning instead of silently losing templates; a failed backup import says so."], ["Fixed", "+, - and digit hotkeys reach the map when no template is selected; resize keeps the template inside the world; new templates get the right number; reordering over the archive no longer throws."]] },
+        { version: "1.10.1", changes: [["Fixed", "Clicking a color row no longer resets the color list's scroll position (and the click reliably toggles the color)."], ["Fixed", "Image drops survive encode failures (retry at half size instead of re-decoding at full size)."], ["Added", "Dropping an http(s) image link imports it; local-file links get a clear message instead of a browser security error."]] },
+        { version: "1.10.0", changes: [["Added", "Color list: 📍 jumps to the nearest missing pixel of that color (available under 100 left)."]] },
+        { version: "1.9.1", changes: [["Added", "Embedded mode: the new frontend bundles the tool with its own launcher and theme."]] },
+        { version: "1.9.0", changes: [["Added", "Support for the new openplace frontend (root URL + data-attribute hooks)."]] },
         { version: "1.8.8", changes: [["Fixed", "Live charge maximum parsing."]] },
         { version: "1.8.7", changes: [["Fixed", "Live charge status synchronization."]] },
         { version: "1.8.6", changes: [["Fixed", "Overlay handle artifact."], ["Fixed", "Charge status accuracy."]] },
@@ -56,6 +63,19 @@
     ];
 
     const pageWin = (typeof unsafeWindow !== "undefined" && unsafeWindow) || window;
+
+    // Embedded mode: the new openplace frontend bundles this tool and provides
+    // its own launcher button and theme. The host page sets this flag BEFORE
+    // loading the script; standalone (userscript) behavior is unchanged.
+    const EMBEDDED = pageWin.__openplaceEmbeddedTemplates === true;
+    // One copy only: with both the userscript and the app's embedded copy
+    // loaded, the second would fight the first for the paint hook and the
+    // layers (audit BUG-54).
+    if (pageWin.__rtplRunning) {
+        console.warn("[Template] another copy of the overlay is already running; this copy exits.");
+        return;
+    }
+    pageWin.__rtplRunning = true;
 
     const gpxToLng = (gpx) => (gpx / TILE_SIZE) / N * 360 - 180;
     const gpyToLat = (gpy) => {
@@ -134,15 +154,14 @@
     let accountRefreshTimer = null;
     let accountMirrorObserver = null, accountMirrorQueued = false;
 
-    async function fetchUserColors() {
-        try {
-            const res = await fetch(`${getBackendBase()}/me`, { credentials: "include" });
-            if (!res.ok) return;
-            const data = await res.json();
-            const u = data?.user ?? data;
+    /** Apply a /me profile (fetched here, or handed over by the host app). */
+    function applyMe(u) {
+        if (!u) return;
+        {
             const bm = Number(u?.extraColorsBitmap);
             if (Number.isFinite(bm)) userExtraColorsBitmap = bm | 0;
             if (typeof u?.droplets === "number") me.droplets = u.droplets;
+            if (Array.isArray(u?.favoriteLocations)) favoriteLocations = u.favoriteLocations;
             if (u?.charges && typeof u.charges.count === "number") {
                 me.charges = u.charges.count;
                 me.max = u.charges.max;
@@ -151,10 +170,22 @@
             }
             userFetched = true;
             updateAccountBar();
+        }
+    }
+
+    async function fetchUserColors() {
+        try {
+            const res = await fetch(`${getBackendBase()}/me`, { credentials: "include" });
+            if (!res.ok) return;
+            const data = await res.json();
+            applyMe(data?.user ?? data);
         } catch (e) {  }
     }
 
     function queueAccountRefresh(delay = 700) {
+        // Embedded: the app refreshes its own profile after a paint and hands
+        // it over through the "openplace:me" event (audit P13).
+        if (EMBEDDED) return;
         clearTimeout(accountRefreshTimer);
         accountRefreshTimer = setTimeout(() => {
             accountRefreshTimer = null;
@@ -168,6 +199,19 @@
     }
 
     function syncLiveChargeStatus() {
+        // New frontend: machine-readable data attributes on the charge chip.
+        const chip = document.querySelector("[data-openplace-charges]");
+        if (chip) {
+            const charges = Number(chip.getAttribute("data-openplace-charges"));
+            const max = Number(chip.getAttribute("data-openplace-charges-max"));
+            if (Number.isFinite(charges) && Number.isFinite(max)) {
+                me.liveCharges = Math.floor(charges);
+                me.liveMax = Math.floor(max);
+                updateAccountBar();
+                return true;
+            }
+        }
+        // Legacy frontend: parse the "Paint N / M" button text.
         const button = document.querySelector(".paint-button");
         const countdown = button?.querySelector(".paint-button-time")?.textContent || "";
         const buttonText = button?.textContent || "";
@@ -207,7 +251,9 @@
     let accountBarEl = null;
     function updateAccountBar() {
         if (!accountBarEl) return;
-        if (me.charges == null) { accountBarEl.style.display = "none"; return; }
+        // Embedded in the app the status bar is redundant — the paint HUD
+        // already shows charges and the account menu shows droplets.
+        if (EMBEDDED || me.charges == null) { accountBarEl.style.display = "none"; return; }
         accountBarEl.style.display = "flex";
         const max = me.liveMax ?? me.max;
         const charges = me.liveCharges ?? estimatedCharges();
@@ -316,11 +362,21 @@
             return localStorage.getItem(key);
         } catch (e) { return null; }
     }
+    let lastStorageWarning = 0;
+    /** Returns true when the value was stored. A failure (quota) is shown to the player (audit BUG-51). */
     async function rawSet(key, value) {
         try {
             if (hasGM) await GM.setValue(key, value);
             else localStorage.setItem(key, value);
-        } catch (e) { LOG("save failed (storage may be full)", e); }
+            return true;
+        } catch (e) {
+            LOG("save failed (storage may be full)", e);
+            if (Date.now() - lastStorageWarning > 30_000) {
+                lastStorageWarning = Date.now();
+                try { showToast("Could not save your templates: the browser storage is full. Export a backup and remove or shrink some templates.", "error", 8000); } catch (_) {}
+            }
+            return false;
+        }
     }
 
     async function storeGet(def) {
@@ -411,9 +467,12 @@
         const templatesBackup = backup.templates.filter((t) => t && typeof t.dataUrl === "string" && /^data:image\//.test(t.dataUrl) && Number.isFinite(t.w) && Number.isFinite(t.h) && t.w > 0 && t.h > 0);
         if (!confirm(`Restore ${templatesBackup.length} template${templatesBackup.length === 1 ? "" : "s"}? This replaces your current templates, presets, and settings.`)) { showToast("Backup import cancelled.", "info"); return; }
         clearTimeout(saveTimer);
-        await rawSet(STORE_KEY, JSON.stringify(templatesBackup));
-        await rawSet(PRESETS_KEY, JSON.stringify(backup.presets));
-        await rawSet(SETTINGS_KEY, JSON.stringify(backup.settings && typeof backup.settings === "object" ? backup.settings : {}));
+        const stored = await rawSet(STORE_KEY, JSON.stringify(templatesBackup));
+        const storedPresets = await rawSet(PRESETS_KEY, JSON.stringify(backup.presets));
+        const storedSettings = await rawSet(SETTINGS_KEY, JSON.stringify(backup.settings && typeof backup.settings === "object" ? backup.settings : {}));
+        if (!stored || !storedPresets || !storedSettings) {
+            throw new Error("The backup could not be stored: the browser storage is full. Remove some templates and try again.");
+        }
         showToast("Backup restored. Reloading…", "success", 1200);
         setTimeout(() => location.reload(), 300);
     }
@@ -446,6 +505,9 @@
     let uiTheme = "dark";
 
     let lastPixel = null;
+    // favoriteLocations from /me: lets a favourite-pin click resolve to the
+    // pin's exact pixel at any zoom (see attachFavoriteMarkerHandler).
+    let favoriteLocations = [];
     let selectedPaintColor = null;
 
     function applyTheme() {
@@ -503,7 +565,7 @@
     }
 
     function paletteColorFromElement(el) {
-        const card = el.closest?.(".palette-card");
+        const card = el.closest?.(".palette-card, [data-openplace-palette]");
         for (let node = el; node && node !== document.body; node = node.parentElement) {
             for (const attr of ["data-color", "data-color-index", "data-palette-index", "value", "aria-label", "title"]) {
                 const value = node.getAttribute?.(attr);
@@ -526,7 +588,7 @@
     function attachPaletteSelectionTracking() {
         document.addEventListener("click", (e) => {
             const el = e.target instanceof Element ? e.target : null;
-            if (!el?.closest(".palette-card")) return;
+            if (!el?.closest(".palette-card, [data-openplace-palette]")) return;
             const color = paletteColorFromElement(el);
             if (color != null) setSelectedPaintColor(color);
         }, true);
@@ -616,23 +678,27 @@
         const img = await ensureImg(t);
         if (!templateCanBackgroundWork(t) || workVersion !== (t._workVersion || 0)) return null;
 
-        const tcv = document.createElement("canvas");
-        tcv.width = t.w; tcv.height = t.h;
-        const tctx = tcv.getContext("2d", { willReadFrequently: true });
-        tctx.imageSmoothingEnabled = false;
-        tctx.drawImage(img, 0, 0, t.naturalW, t.naturalH, 0, 0, t.w, t.h);
-        const td = scaledImageData(img, t.naturalW, t.naturalH, t.w, t.h, gMapScaleAlgorithm);
-
-        const set = PALETTE;
-        const ds = new Set(t.disabled || []);
+        // The scale + nearest-palette pass is the expensive part (up to
+        // 6 M pixels × 64 colours): keep it per template until the image,
+        // size, algorithm or disabled colours change (audit P14).
         const n = t.w * t.h;
-        const target = new Int16Array(n).fill(-1);
-        for (let p = 0; p < n; p++) {
-            const i = p * 4;
-            if (td[i + 3] <= 128) continue;
-            const c = closestInSet(td[i], td[i + 1], td[i + 2], set);
-            if (!c || ds.has(c.index)) continue;
-            target[p] = c.index;
+        const targetSig = `${gridSignature(t)}|${t.naturalW}x${t.naturalH}|${workVersion}|${t.dataUrl ? t.dataUrl.length : 0}`;
+        let target;
+        if (t._targetCache && t._targetCache.sig === targetSig && t._targetCache.target.length === n) {
+            target = t._targetCache.target;
+        } else {
+            const td = scaledImageData(img, t.naturalW, t.naturalH, t.w, t.h, gMapScaleAlgorithm);
+            const set = PALETTE;
+            const ds = new Set(t.disabled || []);
+            target = new Int16Array(n).fill(-1);
+            for (let p = 0; p < n; p++) {
+                const i = p * 4;
+                if (td[i + 3] <= 128) continue;
+                const c = closestInSet(td[i], td[i + 1], td[i + 2], set);
+                if (!c || ds.has(c.index)) continue;
+                target[p] = c.index;
+            }
+            t._targetCache = { sig: targetSig, target };
         }
 
         const { ctx } = await compositeRegion(t.gx, t.gy, t.w, t.h);
@@ -827,7 +893,11 @@
             && Math.abs(ty * TILE_SIZE + TILE_SIZE / 2 - centerY) <= halfH;
     }
 
-    const templateBeforeId = () => map.getLayer("openplace-hover-border") ? "openplace-hover-border" : undefined;
+    // Templates sit below the host's interactive layers: the legacy hover
+    // border, or the app's paint preview and pixel selection (audit BUG-52 —
+    // the app has no hover border, so templates used to land on top).
+    const TEMPLATE_ANCHOR_LAYERS = ["openplace-hover-border", "openplace-paint-queue-canvas-fill", "openplace-pixel-selection-fill"];
+    const templateBeforeId = () => TEMPLATE_ANCHOR_LAYERS.find((id) => map.getLayer(id));
 
     function templateMode(t) {
         if (!map || !t.visible || t.archived || !templateInViewport(t)) return "hidden";
@@ -843,6 +913,13 @@
 
     async function updateTemplateTiles(t, version = t._renderVersion || 0) {
         if (!map || t._deleted) return;
+        // Adding sources/layers while a style is (re)loading throws MapLibre's
+        // "Style is not done loading" — e.g. an image dropped right after the
+        // page opens or during a theme's style swap. Wait it out first.
+        if (!styleAcceptsLayers(map)) {
+            await whenStyleReady(map);
+            if (t._deleted || version !== (t._renderVersion || 0)) return;
+        }
         if (!t._tiles) t._tiles = new Map();
         const inViewport = templateInViewport(t);
         t._inViewport = inViewport;
@@ -850,25 +927,30 @@
         const mode = t._mode = templateMode(t);
 
         if (mode === "hidden") { removeFilledTiles(t); removeDotLayer(t); return; }
-        if (mode === "dots") { removeFilledTiles(t); await renderDotLayer(t, op, version); }
-        else { removeDotLayer(t); await renderFilledTiles(t, op, mode === "err", version); }
+        let added = false;
+        if (mode === "dots") { removeFilledTiles(t); added = await renderDotLayer(t, op, version); }
+        else { removeDotLayer(t); added = await renderFilledTiles(t, op, mode === "err", version); }
         if (version !== (t._renderVersion || 0)) return;
-        restackTemplates();
+        // Restack only when a layer was added (audit P33): every tile update
+        // used to move every layer of every template.
+        if (added) restackTemplates();
     }
 
-    function updateTemplateMoveCoordinates(t) {
+    function updateTemplateMoveCoordinates(t, scaleX = 1, scaleY = 1) {
         if (!map) return;
+        // Rigid translate (move) or linear stretch (resize preview): every
+        // existing slice keeps its content and is re-placed from its stored
+        // position WITHIN the template (offX/offY/ow/oh). Slices stop
+        // aligning to server-tile boundaries mid-drag — harmless for
+        // rendering — and the drop re-slices/re-renders cleanly.
         const updateTiles = (tiles) => {
             if (!tiles) return;
-            for (const [key, e] of tiles) {
-                const [tx, ty] = key.split("-").map(Number);
-                const tileLeft = tx * TILE_SIZE, tileTop = ty * TILE_SIZE;
-                const ix0 = Math.max(t.gx, tileLeft), iy0 = Math.max(t.gy, tileTop);
-                const ix1 = Math.min(t.gx + t.w, tileLeft + TILE_SIZE), iy1 = Math.min(t.gy + t.h, tileTop + TILE_SIZE);
-                const offX = ix0 - t.gx, offY = iy0 - t.gy, ow = ix1 - ix0, oh = iy1 - iy0;
-                if (ow <= 0 || oh <= 0 || e.offX !== offX || e.offY !== offY || e.ow !== ow || e.oh !== oh) continue;
+            for (const e of tiles.values()) {
+                if (!(e.ow > 0) || !(e.oh > 0)) continue;
+                const ix0 = t.gx + e.offX * scaleX, iy0 = t.gy + e.offY * scaleY;
+                const w = e.ow * scaleX, h = e.oh * scaleY;
                 try {
-                    map.getSource(e.sourceId)?.setCoordinates(rasterCoordinates(ix0, ix1, iy0, iy1));
+                    map.getSource(e.sourceId)?.setCoordinates(rasterCoordinates(ix0, ix0 + w, iy0, iy0 + h));
                 } catch (_) {}
             }
         };
@@ -895,7 +977,7 @@
 
     function restackTemplates() {
         if (!map) return;
-        const before = map.getLayer("openplace-hover-border") ? "openplace-hover-border" : undefined;
+        const before = templateBeforeId();
 
         for (let i = templates.length - 1; i >= 0; i--) {
             const t = templates[i];
@@ -944,7 +1026,7 @@
     }
 
     async function buildGridCanvas(t) {
-        const sig = `${renderSig(t)}|${t.w}x${t.h}`;
+        const sig = gridSignature(t);
         if (t._gridCanvas && t._gridSig === sig) return t._gridCanvas;
         const onlyColor = gSelectedColorMode && t.locked ? selectedPaintColor : null;
         const grid = await renderGridCanvas(t, onlyColor);
@@ -1036,7 +1118,9 @@
         return ctx.getImageData(0, 0, dw, dh).data;
     }
 
+    /* Returns true when a layer was added (the caller restacks then). */
     async function renderFilledTiles(t, op, useErr, version) {
+        let added = false;
         const grid = useErr ? t._analysis.errorCanvas : await buildGridCanvas(t);
         if (version !== (t._renderVersion || 0)) return;
 
@@ -1089,7 +1173,9 @@
 
                 const coords = rasterCoordinates(ix0, ix1, iy0, iy1);
 
-                if (fresh || dimsChanged || !map.getSource(e.sourceId)) {
+                // A resized canvas is re-read by the source on the next
+                // refresh (audit P34): no remove/add per zoom step.
+                if (fresh || !map.getSource(e.sourceId)) {
                     if (map.getLayer(e.layerId)) map.removeLayer(e.layerId);
                     if (map.getSource(e.sourceId)) map.removeSource(e.sourceId);
                     map.addSource(e.sourceId, { type: "canvas", canvas: e.canvas, coordinates: coords, animate: false });
@@ -1097,6 +1183,7 @@
                         id: e.layerId, type: "raster", source: e.sourceId,
                         paint: { "raster-opacity": op, "raster-resampling": "nearest", "raster-fade-duration": 0 }
                     }, templateBeforeId());
+                    added = true;
                 } else {
                     try { map.getSource(e.sourceId).setCoordinates(coords); } catch (err) {  }
                     if (rebuilt) refreshCanvasSource(e.sourceId);
@@ -1111,10 +1198,11 @@
             if (map.getSource(e.sourceId)) map.removeSource(e.sourceId);
             t._tiles.delete(key);
         }
+        return added;
     }
 
     async function buildDotGrid(t) {
-        const sig = `${renderSig(t)}|${t.w}x${t.h}`;
+        const sig = gridSignature(t);
         if (t._dotGrid && t._dotGridSig === sig) return t._dotGrid;
         const grid = await buildGridCanvas(t);
         const gw = t.w, gh = t.h;
@@ -1124,14 +1212,15 @@
         return t._dotGrid;
     }
 
+    /* Returns true when a layer was added (the caller restacks then). */
     async function renderDotLayer(t, op, version) {
         if (!t._dotTiles) t._dotTiles = new Map();
+        let added = false;
         const S = DOT_SCALE;
         const grid = await buildDotGrid(t);
         if (version !== (t._renderVersion || 0)) return;
         const sig = `${t._dotGridSig}|S${S}`;
         const c = Math.floor(S / 2);
-        const limited = largeDotTemplate(t);
 
         const txa = Math.floor(t.gx / TILE_SIZE), txb = Math.floor((t.gx + t.w - 1) / TILE_SIZE);
         const tya = Math.floor(t.gy / TILE_SIZE), tyb = Math.floor((t.gy + t.h - 1) / TILE_SIZE);
@@ -1146,7 +1235,10 @@
                 const ix1 = Math.min(t.gx + t.w, tileLeft + TILE_SIZE), iy1 = Math.min(t.gy + t.h, tileTop + TILE_SIZE);
                 const ow = ix1 - ix0, oh = iy1 - iy0;
                 if (ow <= 0 || oh <= 0) continue;
-                if (limited && !visibleLargeDotTile(tx, ty)) continue;
+                // Only tiles near the viewport get a 3× canvas, whatever the
+                // template size (audit P15: every tile of every template
+                // under 4 M px used to be built).
+                if (!visibleLargeDotTile(tx, ty)) continue;
                 const key = `${tx}-${ty}`;
                 needed.add(key);
 
@@ -1186,6 +1278,7 @@
                         id: e.layerId, type: "raster", source: e.sourceId,
                         paint: { "raster-opacity": op, "raster-resampling": "nearest", "raster-fade-duration": 0 }
                     }, templateBeforeId());
+                    added = true;
                 } else {
                     try { map.getSource(e.sourceId).setCoordinates(coords); } catch (err) {  }
                     if (rebuilt) refreshCanvasSource(e.sourceId);
@@ -1200,6 +1293,7 @@
             if (map.getSource(e.sourceId)) map.removeSource(e.sourceId);
             t._dotTiles.delete(key);
         }
+        return added;
     }
 
     function removeLayer(id) {
@@ -1227,15 +1321,44 @@
     function importError(f, e) { return `Couldn't import “${f?.name || "image"}”: ${e?.message || "unknown browser error"}`; }
 
     async function canvasToPreparedImage(canvas) {
-        const blob = await new Promise((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("The browser could not encode the resized image.")), "image/png"));
-        const objectUrl = URL.createObjectURL(blob);
+        // toBlob returns null under memory pressure / encoder limits (seen in
+        // Firefox with big drops). Fall back to the synchronous encoder, then
+        // halve the canvas and retry rather than failing the whole import —
+        // failing here forced a second full-size decode, which is exactly the
+        // memory spike that can take the map's WebGL context down with it.
+        let blob = null;
         try {
-            const img = await loadImage(objectUrl, "processed image");
-            const dataUrl = await fileToDataUrl(blob);
-            return { dataUrl, img };
-        } finally {
-            URL.revokeObjectURL(objectUrl);
+            blob = await new Promise((resolve) => canvas.toBlob((value) => resolve(value || null), "image/png"));
+        } catch (e) { blob = null; }
+        if (blob) {
+            const objectUrl = URL.createObjectURL(blob);
+            try {
+                const img = await loadImage(objectUrl, "processed image");
+                const dataUrl = await fileToDataUrl(blob);
+                return { dataUrl, img };
+            } finally {
+                URL.revokeObjectURL(objectUrl);
+            }
         }
+        try {
+            const dataUrl = canvas.toDataURL("image/png");
+            if (dataUrl && dataUrl.startsWith("data:image/")) {
+                const img = await loadImage(dataUrl, "processed image");
+                return { dataUrl, img };
+            }
+        } catch (e) {  }
+        if (canvas.width >= 2 && canvas.height >= 2) {
+            LOG(`encode failed at ${canvas.width}×${canvas.height}; retrying at half size`);
+            const half = document.createElement("canvas");
+            half.width = Math.max(1, canvas.width >> 1);
+            half.height = Math.max(1, canvas.height >> 1);
+            const ctx = half.getContext("2d");
+            applyScaleAlgorithm(ctx, "high");
+            ctx.drawImage(canvas, 0, 0, half.width, half.height);
+            canvas.width = canvas.height = 1;
+            return canvasToPreparedImage(half);
+        }
+        throw new Error("The browser could not encode the resized image.");
     }
 
     async function decodedFrameToImage(frame, w, h) {
@@ -1416,13 +1539,22 @@
         if (typeof ImageDecoder === "function" && file.type) {
             let decoder = null;
             try {
-                decoder = new ImageDecoder({ data: await file.arrayBuffer(), type: file.type });
+                // The target size belongs to the constructor (audit BUG-56):
+                // decode() has no size options, so large files were decoded
+                // at full size. The header gives the dimensions up front.
+                const data = await file.arrayBuffer();
+                const header = dimensions && Number.isFinite(dimensions.w) && Number.isFinite(dimensions.h) && dimensions.w > 0 && dimensions.h > 0 ? dimensions : null;
+                const headerSafe = header ? safeWorkingSize(header.w, header.h) : null;
+                decoder = new ImageDecoder({
+                    data, type: file.type,
+                    ...(headerSafe && headerSafe.scaled ? { desiredWidth: headerSafe.w, desiredHeight: headerSafe.h } : {})
+                });
                 await decoder.tracks.ready;
                 const track = decoder.tracks.selectedTrack;
-                const sourceW = track.codedWidth, sourceH = track.codedHeight;
+                const sourceW = header ? header.w : track.codedWidth, sourceH = header ? header.h : track.codedHeight;
                 const safe = safeWorkingSize(sourceW, sourceH);
                 showToast(safe.scaled ? `Preparing ${sourceW}×${sourceH} image at ${safe.w}×${safe.h}…` : `Decoding ${file.name}…`, "progress", 0);
-                const { image } = await decoder.decode({ desiredWidth: safe.w, desiredHeight: safe.h });
+                const { image } = await decoder.decode();
                 const result = await decodedFrameToImage(image, safe.w, safe.h);
                 return { ...result, sourceW, sourceH, scaled: safe.scaled };
             } catch (e) {
@@ -1470,9 +1602,10 @@
         gx = wrapHorizontal(gx);
         gy = clamp(gy, 0, WORLD_PIXELS - safe.h);
 
+        const id = nextId++;
         const t = {
-            id: nextId++,
-            name: name || `template ${nextId}`,
+            id,
+            name: name || `template ${id}`,
             dataUrl, naturalW, naturalH,
             gx, gy, w: safe.w, h: safe.h,
             opacity: 0.7, visible: true, locked: false, archived: false,
@@ -1480,6 +1613,7 @@
         };
         templates.unshift(t);
         selectedId = t.id;
+        showToast(`Placing “${t.name}”…`, "progress", 0);
         await updateTemplateTiles(t);
         queueColorUsage(t);
         storeSet();
@@ -1551,6 +1685,15 @@
     const coordString = (tx, ty, px, py) => `tX: ${tx} tY: ${ty} X: ${px} Y: ${py}`;
 
     function parseCoords(str) {
+        // The app's pixel-panel copy format "[tX, tY] · X, Y" (0-based pixels).
+        const dotted = String(str || "").match(/^\[?\s*(\d+)\s*,\s*(\d+)\s*\]?\s*[·•]\s*(\d+)\s*,\s*(\d+)\s*$/);
+        if (dotted) {
+            const [tx, ty, px, py] = dotted.slice(1).map(Number);
+            return {
+                gx: clamp(tx, 0, TILE_COUNT - 1) * TILE_SIZE + clamp(px, 0, TILE_SIZE - 1),
+                gy: clamp(ty, 0, TILE_COUNT - 1) * TILE_SIZE + clamp(py, 0, TILE_SIZE - 1)
+            };
+        }
         const m = String(str || "").match(/\d+/g);
         if (!m) return null;
         const n = m.map(Number);
@@ -1563,7 +1706,8 @@
         return { gx: tx * TILE_SIZE + px - 1, gy: ty * TILE_SIZE + py - 1 };
     }
 
-    const paintPanelOpen = () => !!document.querySelector(".palette-card");
+    const paintPanelOpen = () =>
+        !!document.querySelector(".palette-card") || !!document.querySelector("[data-openplace-palette]");
 
     function selectPixelAfterMove(lng, lat) {
         let done = false;
@@ -1586,6 +1730,13 @@
         selectPixelAfterMove(lng, lat);
         setStatus("");
         return true;
+    }
+
+    function teleportToGp(gx, gy) {
+        if (!map) { setStatus("Map not ready yet — try again in a moment.", "error", 5000); return; }
+        const lng = gpxToLng(gx + 0.5), lat = gpyToLat(gy + 0.5);
+        map.flyTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 14), duration: 800 });
+        selectPixelAfterMove(lng, lat);
     }
 
     async function copyToClipboard(text) {
@@ -1778,7 +1929,12 @@
             code.appendChild(input);
         }
         Object.assign(actions.style, { display: "flex", flexDirection: "column", gap: "8px", marginTop: "2px" });
-        Object.assign(primary.style, { width: "100%", minHeight: "40px", border: "1px solid #4a82ed", borderRadius: "7px", background: "#477df0", color: "#fff", fontWeight: "650", cursor: "pointer" });
+        Object.assign(primary.style, { width: "100%", minHeight: "40px", border: "1px solid #4a82ed", borderRadius: "7px", background: "#477df0", color: "#fff", fontWeight: "650", cursor: "pointer", transition: "transform .06s ease, background .15s ease, border-color .15s ease" });
+        // Physical press feedback — the button visibly reacts to every click.
+        primary.addEventListener("pointerdown", () => { primary.style.transform = "scale(.96)"; });
+        const releasePress = () => { primary.style.transform = ""; };
+        primary.addEventListener("pointerup", releasePress);
+        primary.addEventListener("pointerleave", releasePress);
         Object.assign(close.style, { alignSelf: "center", padding: "3px 8px", border: "none", background: "transparent", color: "#9eabb9", fontSize: "11px", cursor: "pointer" });
         icon.appendChild(marker);
         preview.append(previewImage, previewText);
@@ -1792,8 +1948,17 @@
         return shareDialog;
     }
 
+    // Restore the primary button after a copy-feedback flash (also called when
+    // the dialog is reused for another mode while a revert timer is pending).
+    function resetShareDialogPrimary(dialog) {
+        clearTimeout(dialog.revertTimer);
+        dialog.primary.style.background = "#477df0";
+        dialog.primary.style.borderColor = "#4a82ed";
+    }
+
     function showShareCode(code) {
         const dialog = getShareDialog();
+        resetShareDialogPrimary(dialog);
         dialog.title.textContent = "Share template";
         dialog.subtitle.textContent = "Send this 10-character code to another user.";
         dialog.preview.style.display = "none";
@@ -1802,12 +1967,25 @@
         dialog.setReadOnly(true);
         dialog.primary.textContent = "Copy share code";
         dialog.close.textContent = "Close";
-        dialog.primary.onclick = async () => showToast(await copyToClipboard(dialog.getCode()) ? "Share code copied." : "Copy failed. Select the code and copy it manually.", "info", 5000);
+        dialog.primary.onclick = async () => {
+            const ok = await copyToClipboard(dialog.getCode());
+            // The button itself confirms the copy: label + color flash.
+            resetShareDialogPrimary(dialog);
+            dialog.primary.textContent = ok ? "Copied!" : "Copy failed";
+            dialog.primary.style.background = ok ? "#2f9e63" : "#c24b45";
+            dialog.primary.style.borderColor = ok ? "#2f9e63" : "#c24b45";
+            dialog.revertTimer = setTimeout(() => {
+                resetShareDialogPrimary(dialog);
+                dialog.primary.textContent = "Copy share code";
+            }, 1500);
+            if (!ok) showToast("Copy failed. Select the code and copy it manually.", "error", 5000);
+        };
         dialog.root.style.display = "flex";
     }
 
-    function showImportShareDialog() {
+    function showImportShareDialog(prefillCode) {
         const dialog = getShareDialog();
+        resetShareDialogPrimary(dialog);
         let pendingShare = null;
         const resetPreview = () => {
             pendingShare = null;
@@ -1845,6 +2023,11 @@
         };
         dialog.root.style.display = "flex";
         dialog.inputs[0].focus();
+        // Prefilled code (e.g. from an event notification): load the preview
+        // right away — the player still reviews before importing. Guarded so
+        // a click-event arg from the panel button never counts as a code.
+        const prefillText = typeof prefillCode === "string" ? prefillCode.replace(/[^A-Za-z0-9]/g, "") : "";
+        if (prefillText.length === 10) { dialog.setCode(prefillText); dialog.primary.onclick(); }
     }
 
     async function shareTemplate(t) {
@@ -1948,6 +2131,7 @@
         });
 
         svg = document.createElementNS(SVGNS, "svg");
+        svg.setAttribute("class", "rtpl-map-svg");
         svg.setAttribute("width", "100%");
         svg.setAttribute("height", "100%");
         svg.style.position = "absolute";
@@ -2201,8 +2385,11 @@
                 resizeFromHandle(t, drag, pgx, pgy, e.shiftKey);
             }
             t._analysis = null;
+            // Both gestures reposition the existing slices only (buttery):
+            // moves translate, resizes stretch as a live preview. The real
+            // re-render happens once on drop.
             if (drag.mode === "move") updateTemplateMoveCoordinates(t);
-            queueTemplateRender(t);
+            else updateTemplateMoveCoordinates(t, t.w / (drag.start.w || 1), t.h / (drag.start.h || 1));
             updateOverlay();
             renderPanelLight();
         };
@@ -2213,6 +2400,8 @@
             drag = null;
             storeSet();
             renderPanel();
+            const dropped = selected();
+            if (wasMoving && dropped) queueTemplateRender(dropped);
 
             const t = selected();
             if (wasMoving && t && errorMode && t.visible) {
@@ -2259,16 +2448,21 @@
         }
 
         t.gx = wrapHorizontal(Math.round(left));
-        t.gy = clamp(Math.round(top), 0, WORLD_PIXELS - 1);
         t.w = Math.max(1, Math.round(right - left));
         t.h = Math.max(1, Math.round(bottom - top));
         const safe = safeWorkingSize(t.w, t.h);
         if (safe.scaled) { t.w = safe.w; t.h = safe.h; }
+        // Clamp with the height so the template stays inside the world (audit BUG-58).
+        t.gy = clamp(Math.round(top), 0, Math.max(0, WORLD_PIXELS - t.h));
     }
 
     function attachDropHandlers() {
         const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
         const hasFiles = (e) => !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+        // Also claim link drags (e.g. an image dragged from another tab or the
+        // browser's downloads list) — otherwise the browser's default action
+        // navigates, which Firefox logs as a file:/// security error.
+        const importableDrag = (e) => !!e.dataTransfer && (hasFiles(e) || Array.from(e.dataTransfer.types || []).includes("text/uri-list"));
         let dropHint = null;
         let dragDepth = 0;
         const editorOpen = () => editor && !editor.classList.contains("rtpl-hidden");
@@ -2283,15 +2477,15 @@
         const hideHint = () => { dragDepth = 0; dropHint?.remove(); dropHint = null; };
 
         window.addEventListener("dragenter", (e) => {
-            if (!hasFiles(e)) return;
+            if (!importableDrag(e)) return;
             stop(e); dragDepth++; showHint();
         });
         window.addEventListener("dragover", (e) => {
-            if (!hasFiles(e)) return;
+            if (!importableDrag(e)) return;
             stop(e); e.dataTransfer.dropEffect = "copy";
         });
         window.addEventListener("dragleave", (e) => {
-            if (!hasFiles(e)) return;
+            if (!importableDrag(e)) return;
             dragDepth--;
 
             if (dragDepth <= 0 || e.relatedTarget === null) hideHint();
@@ -2303,28 +2497,53 @@
 
         window.addEventListener("drop", async (e) => {
             const files = e.dataTransfer?.files;
+            // Read synchronously — the drag data store is cleared after the event.
+            const uriList = e.dataTransfer?.getData?.("text/uri-list") || "";
             hideHint();
-            if (!files || !files.length) return;
+            const hasDroppedFiles = !!files && files.length > 0;
+            if (!hasDroppedFiles && !uriList) return;
             stop(e);
+            const dropPoint = { x: e.clientX, y: e.clientY };
 
-            if (editorOpen()) {
-                const img = [...files].find(isImageFile);
-                try {
-                    if (!img) throw new Error("Drop an image file to load it into the editor.");
-                    const prepared = await prepareImageFile(img);
-                    await editorSetSource(prepared.dataUrl, img.name.replace(/\.[^.]+$/, ""), null, prepared.img);
-                    showToast(prepared.scaled ? `Loaded “${img.name}” at ${prepared.img.naturalWidth}×${prepared.img.naturalHeight}.` : `Loaded “${img.name}”.`, "success");
-                } catch (err) { LOG("editor drop failed", err); showToast(importError(img, err), "error", 7000); }
-                return;
+            const importAll = async (list) => {
+                if (editorOpen()) {
+                    const img = [...list].find(isImageFile);
+                    try {
+                        if (!img) throw new Error("Drop an image file to load it into the editor.");
+                        const prepared = await prepareImageFile(img);
+                        await editorSetSource(prepared.dataUrl, img.name.replace(/\.[^.]+$/, ""), null, prepared.img);
+                        showToast(prepared.scaled ? `Loaded “${img.name}” at ${prepared.img.naturalWidth}×${prepared.img.naturalHeight}.` : `Loaded “${img.name}”.`, "success");
+                    } catch (err) { LOG("editor drop failed", err); showToast(importError(img, err), "error", 7000); }
+                    return;
+                }
+                if (!map) { setStatus("Map not ready yet — try again in a moment.", "error", 5000); return; }
+                const rect = map.getContainer().getBoundingClientRect();
+                let lngLat = null;
+                if (dropPoint.x >= rect.left && dropPoint.x <= rect.right && dropPoint.y >= rect.top && dropPoint.y <= rect.bottom) {
+                    const ll = map.unproject([dropPoint.x - rect.left, dropPoint.y - rect.top]);
+                    lngLat = [ll.lng, ll.lat];
+                }
+                for (const f of list) await createTemplateFromFile(f, lngLat);
+            };
+
+            if (hasDroppedFiles) { await importAll(files); return; }
+
+            // Link-only drop (image dragged from another tab / downloads list).
+            const url = uriList.split(/\r?\n/).find((line) => line && !line.startsWith("#")) || "";
+            if (/^file:/i.test(url)) { showToast("That drop was a link to a local file — drag the file itself from your file manager instead.", "error", 6000); return; }
+            if (!/^https?:/i.test(url)) return;
+            try {
+                showToast("Downloading dropped image…", "progress", 0);
+                const res = await fetch(url, { mode: "cors" });
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                const blob = await res.blob();
+                if (!/^image\//.test(blob.type || "")) throw new Error("The link does not point to an image.");
+                const name = decodeURIComponent((url.split("/").pop() || "").split("?")[0]) || "dropped-image";
+                await importAll([new File([blob], name, { type: blob.type })]);
+            } catch (err) {
+                LOG("image link drop failed", err);
+                showToast("Couldn't download that image link (the site may block cross-origin requests). Save the image and drop the file instead.", "error", 7000);
             }
-            if (!map) { setStatus("Map not ready yet — try again in a moment.", "error", 5000); return; }
-            const rect = map.getContainer().getBoundingClientRect();
-            let lngLat = null;
-            if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
-                const ll = map.unproject([e.clientX - rect.left, e.clientY - rect.top]);
-                lngLat = [ll.lng, ll.lat];
-            }
-            for (const f of files) await createTemplateFromFile(f, lngLat);
         });
     }
 
@@ -2434,6 +2653,9 @@
         document.body.appendChild(fab);
         if (fabPosition) { setFloatingPosition(fab, fabPosition); clampFabIntoView(); }
         makeFabDraggable();
+        // Embedded: the host frontend has its own toolbar launcher, so hide
+        // the tool's floating button entirely.
+        if (EMBEDDED) fab.style.display = "none";
 
         panel = document.createElement("div");
         panel.className = "rtpl-panel" + (panelOpen ? "" : " rtpl-hidden");
@@ -2451,13 +2673,14 @@
                 <button class="rtpl-add rtpl-importcode">Import code</button>
                 <input type="file" accept="image/*" multiple class="rtpl-file" hidden>
             </div>
+            ${EMBEDDED ? "" : `
             <div class="rtpl-actions rtpl-tp">
                 <input type="text" class="rtpl-tp-input" placeholder="Jump to tX tY X Y">
                 <div class="rtpl-tp-btns">
                     <button class="rtpl-toggle rtpl-tp-go" title="Go to coordinates">Go</button>
                     <button class="rtpl-toggle rtpl-tp-pick" title="Put the last selected map pixel coordinates in the jump field and copy them">Copy coordinates</button>
                 </div>
-            </div>
+            </div>`}
             <div class="rtpl-tpl">
                 <div class="rtpl-tpl-head"><button class="rtpl-tpl-caret">▾</button> Templates</div>
                 <div class="rtpl-tpl-body">
@@ -2501,11 +2724,12 @@
                         <button class="rtpl-toggle rtpl-g-outline"></button>
                     </div>
                     <div class="rtpl-g-cmrow">Map resize sampling <select class="rtpl-g-scale"></select></div>
+                    ${EMBEDDED ? "" : `
                     <div class="rtpl-g-cmrow"><button class="rtpl-toggle rtpl-ruler" title="Measure the pixel distance between two map clicks">Ruler</button></div>
                     <div class="rtpl-g-cmrow">WASD pan step
                         <input type="number" class="rtpl-g-panstep" min="1" max="5000" step="10">
                         <span class="rtpl-muted">px / press</span>
-                    </div>
+                    </div>`}
                     <div class="rtpl-backup"><button class="rtpl-toggle rtpl-backup-export">Export backup</button><button class="rtpl-toggle rtpl-backup-import">Import backup</button><input type="file" accept="application/json,.json" class="rtpl-backup-file" hidden></div>
                 </div>
             </div>
@@ -2522,6 +2746,53 @@
         panel.querySelector(".rtpl-help").addEventListener("click", () => showWalkthrough(true));
         panel.querySelector(".rtpl-changelog").addEventListener("click", showChangelog);
         panel.querySelector(".rtpl-theme").addEventListener("click", () => setTheme(uiTheme === "light" ? "dark" : "light"));
+
+        if (EMBEDDED) {
+            // Toolbar launcher in the host frontend toggles the panel.
+            pageWin.addEventListener("openplace:templates-toggle", () => {
+                panelOpen = panel.classList.contains("rtpl-hidden");
+                panel.classList.toggle("rtpl-hidden", !panelOpen);
+                if (panelOpen) clampPanelIntoView();
+                saveSettings();
+            });
+            // Host eyedropper: the colour a visible template shows at a world
+            // pixel ([r,g,b] or null). Topmost template wins; transparent
+            // template pixels fall through to the one below.
+            pageWin.__openplaceTemplateColorAt = async (gx, gy) => {
+                for (const t of templates) {
+                    if (!t.visible || t.archived || !(t.opacity > 0)) continue;
+                    const lx = Math.floor(unwrapHorizontalNear(gx, t.gx + t.w / 2) - t.gx);
+                    const ly = Math.floor(gy - t.gy);
+                    if (lx < 0 || ly < 0 || lx >= t.w || ly >= t.h) continue;
+                    try {
+                        const grid = await buildDotGrid(t);
+                        const i = (ly * grid.gw + lx) * 4;
+                        if ((grid.data[i + 3] ?? 0) < 128) continue;
+                        return [grid.data[i], grid.data[i + 1], grid.data[i + 2]];
+                    } catch (_) { /* grid unavailable — fall through */ }
+                }
+                return null;
+            };
+
+            // Event notifications can hand the player a template share code —
+            // open the import dialog prefilled (preview first, then import).
+            pageWin.addEventListener("openplace:template-import", (event) => {
+                const code = String(event?.detail?.code || "").trim();
+                if (!/^[A-Za-z0-9]{10}$/.test(code)) return;
+                panelOpen = true;
+                panel.classList.remove("rtpl-hidden");
+                clampPanelIntoView();
+                saveSettings();
+                showImportShareDialog(code);
+            });
+            // The host app owns the theme (data-theme on <html>) — follow it
+            // live and hide the tool's own theme toggle.
+            panel.querySelector(".rtpl-theme").style.display = "none";
+            const syncHostTheme = () => setTheme(document.documentElement.dataset.theme === "light" ? "light" : "dark");
+            new MutationObserver(syncHostTheme)
+                .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+            syncHostTheme();
+        }
 
         const settings = panel.querySelector(".rtpl-settings");
         panel.querySelector(".rtpl-settings-head").addEventListener("click", () => {
@@ -2550,19 +2821,23 @@
             backupInput.value = "";
         });
 
+        // Embedded: the host app's search field handles coordinate jumps, so
+        // the whole teleport row is omitted from the panel.
         const tpInput = panel.querySelector(".rtpl-tp-input");
-        const doTeleport = () => { if (teleportTo(tpInput.value)) tpInput.blur(); };
-        panel.querySelector(".rtpl-tp-go").addEventListener("click", doTeleport);
-        tpInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doTeleport(); } });
+        if (tpInput) {
+            const doTeleport = () => { if (teleportTo(tpInput.value)) tpInput.blur(); };
+            panel.querySelector(".rtpl-tp-go").addEventListener("click", doTeleport);
+            tpInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doTeleport(); } });
 
-        panel.querySelector(".rtpl-tp-pick").addEventListener("click", async () => {
-            if (!lastPixel) { flashStatus("Click a pixel on the map first.", 3500, "error"); return; }
-            const { tx, ty, px, py } = gpToTilePixel(lastPixel.gx, lastPixel.gy);
-            const s = coordString(tx, ty, px, py);
-            tpInput.value = s;
-            const ok = await copyToClipboard(s);
-            flashStatus(ok ? `Copied: ${s}` : s);
-        });
+            panel.querySelector(".rtpl-tp-pick").addEventListener("click", async () => {
+                if (!lastPixel) { flashStatus("Click a pixel on the map first.", 3500, "error"); return; }
+                const { tx, ty, px, py } = gpToTilePixel(lastPixel.gx, lastPixel.gy);
+                const s = coordString(tx, ty, px, py);
+                tpInput.value = s;
+                const ok = await copyToClipboard(s);
+                flashStatus(ok ? `Copied: ${s}` : s);
+            });
+        }
         fileInput.addEventListener("change", async (e) => {
             const placement = lastPixel ? [gpxToLng(lastPixel.gx), gpyToLat(lastPixel.gy)] : null;
             for (const f of e.target.files) await createTemplateFromFile(f, placement);
@@ -2584,8 +2859,11 @@
         hideDoneCb.checked = gHideCompleted;
         const setOutlineLabel = () => { outlineBtn.textContent = `${OUTLINE_LABELS[gOutlineMode]}`; };
         setOutlineLabel();
-        updateRulerControl();
-        rulerBtn.addEventListener("click", toggleRuler);
+        // Embedded: the host app's measure tool covers the ruler — no button.
+        if (rulerBtn) {
+            updateRulerControl();
+            rulerBtn.addEventListener("click", toggleRuler);
+        }
         shrinkCb.addEventListener("change", async (e) => {
             gShrink = e.target.checked; saveSettings();
             await applyGlobalDisplayChange();
@@ -2631,12 +2909,14 @@
             await applyGlobalDisplayChange();
         });
         const panstepIn = panel.querySelector(".rtpl-g-panstep");
-        panstepIn.value = gPanStep;
-        panstepIn.addEventListener("change", (e) => {
-            const v = parseInt(e.target.value);
-            if (v > 0) { gPanStep = clamp(v, 1, 5000); panstepIn.value = gPanStep; saveSettings(); }
-            else panstepIn.value = gPanStep;
-        });
+        if (panstepIn) {
+            panstepIn.value = gPanStep;
+            panstepIn.addEventListener("change", (e) => {
+                const v = parseInt(e.target.value);
+                if (v > 0) { gPanStep = clamp(v, 1, 5000); panstepIn.value = gPanStep; saveSettings(); }
+                else panstepIn.value = gPanStep;
+            });
+        }
 
         wireDownloadTool();
         makeDraggable(panel, panel.querySelector(".rtpl-head"), () => { clampPanelIntoView(); panelPosition = floatingPosition(panel); saveSettings(); });
@@ -2761,29 +3041,82 @@
         map.on("click", (e) => {
             const gx = Math.floor(lngToGpx(e.lngLat.lng));
             const gy = Math.floor(latToGpy(e.lngLat.lat));
-
-            lastPixel = { gx, gy };
-            queueAccountRefresh();
-            if (rulerMode) {
-                if (!rulerStart) {
-                    rulerStart = [gx, gy];
-                    showToast("Ruler start set. Click the second pixel.", "info", 3500);
-                } else {
-                    rulerEnd = [gx, gy];
-                    rulerMode = false;
-                    showToast("Ruler measurement ready.", "success", 2500);
-                }
-                updateRulerControl();
-                updateOverlay();
-                return;
-            }
-            if (!pickMode) return;
-            dlSetCorner(pickMode, gx, gy);
-            dlStatus(`Corner ${pickMode} set to tile ${Math.floor(gx / TILE_SIZE)},${Math.floor(gy / TILE_SIZE)}.`);
-            pickMode = 0;
-            panel.querySelector(".rtpl-pick1").classList.remove("rtpl-active");
-            panel.querySelector(".rtpl-pick2").classList.remove("rtpl-active");
+            onPixelClick(gx, gy);
         });
+        attachFavoriteMarkerHandler();
+    }
+
+    // The beta frontend draws favourite locations as ".favorite-marker" star
+    // buttons over the map (MapLibre Marker, default centre anchor). A click
+    // on a star never reaches the canvas (it even stops propagation), so map
+    // "click" never fires, while the app itself selects the star's pixel.
+    // Mirror that here so "Copy coordinates" and "Use selected pixel" see
+    // the star, not the previous map click.
+    const FAVORITE_PIN_SELECTOR = ".favorite-marker";
+    const favoriteHookedContainers = new WeakSet();
+    function attachFavoriteMarkerHandler() {
+        const container = map.getContainer?.();
+        if (!container || favoriteHookedContainers.has(container)) return;
+        favoriteHookedContainers.add(container);
+        container.addEventListener("click", (e) => {
+            const pin = e.target instanceof Element ? e.target.closest(FAVORITE_PIN_SELECTOR) : null;
+            if (!pin || !map || map.getContainer() !== container) return;
+            const gp = favoritePinPixel(pin);
+            if (gp) onPixelClick(gp.gx, gp.gy);
+        }, true);
+    }
+
+    /** Global pixel of a favourite pin: the favourite's own coordinates when
+     *  /me lists it (exact at any zoom), else the pin's anchor unprojected. */
+    function favoritePinPixel(pin) {
+        try {
+            const rect = pin.getBoundingClientRect();
+            const mapRect = map.getContainer().getBoundingClientRect();
+            // Centre anchor: the star's middle sits on the location.
+            const anchor = [rect.left + rect.width / 2 - mapRect.left, rect.top + rect.height / 2 - mapRect.top];
+            const est = map.unproject(anchor);
+            let best = null, bestDist = 6; // screen px; a pin sits within a pixel of its location
+            for (const fav of favoriteLocations) {
+                if (!Number.isFinite(fav?.latitude) || !Number.isFinite(fav?.longitude)) continue;
+                // Compare on the world copy the pin is drawn on.
+                let lng = fav.longitude;
+                while (lng - est.lng > 180) lng -= 360;
+                while (lng - est.lng < -180) lng += 360;
+                const p = map.project([lng, fav.latitude]);
+                const d = Math.hypot(p.x - anchor[0], p.y - anchor[1]);
+                if (d < bestDist) { bestDist = d; best = fav; }
+            }
+            // Unknown pin (favourite added since the last /me): use the
+            // estimate now and refresh the profile for next time.
+            if (!best) queueAccountRefresh(0);
+            const lng = best ? best.longitude : est.lng, lat = best ? best.latitude : est.lat;
+            return { gx: wrapHorizontal(Math.floor(lngToGpx(lng))), gy: clamp(Math.floor(latToGpy(lat)), 0, WORLD_PIXELS - 1) };
+        } catch (e) { return null; }
+    }
+
+    /** A map pixel was selected (canvas click or favourite pin). */
+    function onPixelClick(gx, gy) {
+        lastPixel = { gx, gy };
+        queueAccountRefresh();
+        if (rulerMode) {
+            if (!rulerStart) {
+                rulerStart = [gx, gy];
+                showToast("Ruler start set. Click the second pixel.", "info", 3500);
+            } else {
+                rulerEnd = [gx, gy];
+                rulerMode = false;
+                showToast("Ruler measurement ready.", "success", 2500);
+            }
+            updateRulerControl();
+            updateOverlay();
+            return;
+        }
+        if (!pickMode) return;
+        dlSetCorner(pickMode, gx, gy);
+        dlStatus(`Corner ${pickMode} set to tile ${Math.floor(gx / TILE_SIZE)},${Math.floor(gy / TILE_SIZE)}.`);
+        pickMode = 0;
+        panel.querySelector(".rtpl-pick1").classList.remove("rtpl-active");
+        panel.querySelector(".rtpl-pick2").classList.remove("rtpl-active");
     }
 
     const keyboardPanKeys = new Set();
@@ -2830,6 +3163,10 @@
         window.addEventListener("keydown", (e) => {
             if (e.ctrlKey || e.metaKey || e.altKey || keyboardPanBlocked()) return;
             if (["Minus", "NumpadSubtract", "Equal", "NumpadAdd"].includes(e.code)) {
+                // Without a selected template the keys belong to the map
+                // (keyboard zoom) — audit BUG-57.
+                const current = selected();
+                if (!current || current.archived) return;
                 e.preventDefault();
                 e.stopPropagation();
                 adjustSelectedOpacity(["Minus", "NumpadSubtract"].includes(e.code) ? -0.05 : 0.05);
@@ -2844,7 +3181,8 @@
                 goToTemplate(t);
                 return;
             }
-            if (!keyboardPanCodes.has(e.code)) return;
+            // Embedded: the host app pans on WASD/arrows itself.
+            if (EMBEDDED || !keyboardPanCodes.has(e.code)) return;
             e.preventDefault();
             e.stopPropagation();
             keyboardPanKeys.add(e.code);
@@ -2882,6 +3220,45 @@
         }
     }
 
+    // Tile downloads for the analysis (audit P12): the server answers 304 to
+    // a conditional request when the tile did not change, so the browser
+    // cache is used ("no-cache" revalidates, the old "no-store" plus a
+    // Date.now() buster re-downloaded every PNG every 15 s). Requests run
+    // a few at a time and one tile is shared between the templates of a
+    // tick.
+    const TILE_FETCH_CONCURRENCY = 6;
+    const TILE_FETCH_TTL_MS = 5000;
+    const tileBitmapCache = new Map();
+    let tileFetchActive = 0;
+    const tileFetchQueue = [];
+    function pumpTileFetches() {
+        while (tileFetchActive < TILE_FETCH_CONCURRENCY && tileFetchQueue.length) {
+            const { job, resolve } = tileFetchQueue.shift();
+            tileFetchActive++;
+            job().then(resolve, () => resolve(null)).finally(() => { tileFetchActive--; pumpTileFetches(); });
+        }
+    }
+    function fetchTileBitmap(url) {
+        const now = Date.now();
+        const hit = tileBitmapCache.get(url);
+        if (hit && now - hit.at < TILE_FETCH_TTL_MS) return hit.promise;
+        const promise = new Promise((resolve) => {
+            tileFetchQueue.push({
+                resolve,
+                job: async () => {
+                    const res = await fetch(url, { credentials: "include", cache: "no-cache" });
+                    return res.ok ? await createImageBitmap(await res.blob()) : null;
+                }
+            });
+            pumpTileFetches();
+        });
+        tileBitmapCache.set(url, { at: now, promise });
+        if (tileBitmapCache.size > 256) {
+            for (const [key, entry] of tileBitmapCache) if (now - entry.at >= TILE_FETCH_TTL_MS) tileBitmapCache.delete(key);
+        }
+        return promise;
+    }
+
     async function compositeRegion(gx, gy, w, h) {
         const out = document.createElement("canvas");
         out.width = w; out.height = h;
@@ -2890,20 +3267,23 @@
 
         const base = getBackendBase();
 
-        const bust = Date.now();
         const tx0 = Math.floor(gx / TILE_SIZE), tx1 = Math.floor((gx + w - 1) / TILE_SIZE);
         const ty0 = Math.floor(gy / TILE_SIZE), ty1 = Math.floor((gy + h - 1) / TILE_SIZE);
 
+        const wanted = [];
         for (let ty = ty0; ty <= ty1; ty++) {
             for (let tx = tx0; tx <= tx1; tx++) {
                 const wx = ((tx % TILE_COUNT) + TILE_COUNT) % TILE_COUNT;
                 const wy = ((ty % TILE_COUNT) + TILE_COUNT) % TILE_COUNT;
-                const url = `${base}/files/s0/tiles/${wx}/${wy}.png?_=${bust}`;
-                let bmp = null;
-                try {
-                    const res = await fetch(url, { credentials: "include", cache: "no-store" });
-                    if (res.ok) bmp = await createImageBitmap(await res.blob());
-                } catch (e) {  }
+                wanted.push({ tx, ty, url: `${base}/files/s0/tiles/${wx}/${wy}.png` });
+            }
+        }
+        const bitmaps = await Promise.all(wanted.map((tile) => fetchTileBitmap(tile.url)));
+
+        for (let k = 0; k < wanted.length; k++) {
+            const { tx, ty } = wanted[k];
+            const bmp = bitmaps[k];
+            {
                 if (!bmp) continue;
                 const tileLeft = tx * TILE_SIZE, tileTop = ty * TILE_SIZE;
                 const ix0 = Math.max(gx, tileLeft), iy0 = Math.max(gy, tileTop);
@@ -2935,13 +3315,16 @@
             try { handle.setPointerCapture(e.pointerId); } catch (_) {}
             card.classList.add("rtpl-dragging");
             const onMove = (ev) => {
-                const others = [...panelBody.querySelectorAll(".rtpl-card:not(.rtpl-dragging)")];
+                // Siblings only: the archive section is another container and
+                // inserting before one of its cards threw (audit BUG-58).
+                const parent = card.parentElement || panelBody;
+                const others = [...parent.querySelectorAll(":scope > .rtpl-card:not(.rtpl-dragging)")];
                 let placed = false;
                 for (const s of others) {
                     const r = s.getBoundingClientRect();
-                    if (ev.clientY < r.top + r.height / 2) { panelBody.insertBefore(card, s); placed = true; break; }
+                    if (ev.clientY < r.top + r.height / 2) { parent.insertBefore(card, s); placed = true; break; }
                 }
-                if (!placed) panelBody.appendChild(card);
+                if (!placed) parent.appendChild(card);
             };
             const onUp = () => {
                 window.removeEventListener("pointermove", onMove);
@@ -3047,8 +3430,16 @@
             `;
 
             card.addEventListener("pointerdown", (e) => {
-                if (e.target.closest("input,button,select,.rtpl-dim,.rtpl-drag")) return;
-                selectedId = t.id; renderPanel(); updateOverlay();
+                // label: the color-list rows — rebuilding the panel mid-press
+                // detached the pressed row (checkbox never toggled) and reset
+                // the list's scroll position.
+                if (e.target.closest("input,button,select,label,.rtpl-dim,.rtpl-drag")) return;
+                if (selectedId === t.id) return;
+                // Light selection (audit P33): swap the highlight instead of
+                // rebuilding every card.
+                selectedId = t.id;
+                for (const other of panelBody.querySelectorAll(".rtpl-card")) other.classList.toggle("rtpl-sel", Number(other.dataset.card) === t.id);
+                updateOverlay();
             });
 
             attachReorder(card, card.querySelector(".rtpl-drag"));
@@ -3199,8 +3590,12 @@
         return !!(panelOpen && !t.collapsed);
     }
 
+    let autoRunAgain = false;
     async function autoAnalyzeTick() {
-        if (autoRunning || !map || document.hidden) return;
+        if (!map || document.hidden) return;
+        // A request that lands during a run is honoured after it (audit
+        // BUG-58): it used to be dropped.
+        if (autoRunning) { autoRunAgain = true; return; }
         const actives = templates.filter(needsAnalysis);
         if (!actives.length) return;
         autoRunning = true;
@@ -3213,6 +3608,7 @@
         } finally {
             autoRunning = false;
         }
+        if (autoRunAgain) { autoRunAgain = false; await autoAnalyzeTick(); }
     }
 
     const totalsHtmlFor = (t) => {
@@ -3221,6 +3617,49 @@
             ? `<span class="rtpl-tg">✅ ${tot.correct}</span><span class="rtpl-ty">🟨 ${tot.missing}</span><span class="rtpl-tr">🟥 ${tot.wrong}</span><span class="rtpl-tt">Σ ${tot.total}</span>`
             : `<span class="rtpl-muted">Comparing…</span>`;
     };
+
+    // "Go to nearest missing pixel" is only offered for near-finished colors:
+    // scanning/teleporting through thousands of gaps helps nobody.
+    const TELEPORT_MISSING_CAP = 100;
+
+    function setTeleportState(btn, pc, remaining, colorEnabled) {
+        let title = "Go to the nearest missing pixel of this color";
+        let enabled = false;
+        if (!colorEnabled) title = "Enable the color first";
+        else if (!pc) title = "Waiting for the next comparison";
+        else if (remaining === 0) title = "Color complete — nothing missing";
+        else if (remaining >= TELEPORT_MISSING_CAP) title = `Unlocks when fewer than ${TELEPORT_MISSING_CAP} pixels are left`;
+        else enabled = true;
+        btn.disabled = !enabled;
+        btn.title = title;
+    }
+
+    function nearestMissingForColor(t, colorIndex) {
+        const a = t._analysis;
+        if (!a || !map) return null;
+        const { target, correct, gx, gy, w } = a;
+        // remaining < 100 is enforced by the button state; the cap here only
+        // guards against a stale row acting on a fresher, larger analysis.
+        const candidates = [];
+        for (let p = 0; p < target.length; p++) {
+            if (target[p] === colorIndex && !correct[p]) {
+                if (candidates.length >= TELEPORT_MISSING_CAP) return null;
+                candidates.push(p);
+            }
+        }
+        if (!candidates.length) return null;
+        const c = map.getCenter();
+        const cx = lngToGpx(c.lng), cy = latToGpy(c.lat);
+        let best = null, bestD = Infinity;
+        for (const p of candidates) {
+            const px = gx + (p % w), py = gy + Math.floor(p / w);
+            const dx = wrappedPixelDistance(px + 0.5 - cx);
+            const dy = py + 0.5 - cy;
+            const d = dx * dx + dy * dy;
+            if (d < bestD) { bestD = d; best = { gx: px, gy: py }; }
+        }
+        return best;
+    }
 
     function applyAnalysisToCard(t, card) {
         const box = card?.querySelector(".rtpl-colors");
@@ -3235,6 +3674,8 @@
             const remaining = pc ? (pc.total - pc.correct) : total;
             const cc = row.querySelector(".rtpl-cc");
             if (cc) cc.innerHTML = `${remaining}<span class="rtpl-muted">/${total}</span>`;
+            const tp = row.querySelector(".rtpl-cl-tp");
+            if (tp) setTeleportState(tp, pc, remaining, !!row.querySelector("input")?.checked);
 
             row.style.display = (gHideCompleted && pc && remaining === 0) ? "none" : "";
         }
@@ -3259,6 +3700,8 @@
         if (!box) return;
         if (!t.locked) { box.innerHTML = ""; box.style.display = "none"; return; }
         box.style.display = "block";
+        // Rebuilds must not lose the user's place in a long color list.
+        const prevScroll = box.querySelector(".rtpl-cl-list")?.scrollTop || 0;
 
         box.innerHTML = `
             <div class="rtpl-totals">${totalsHtmlFor(t)}</div>
@@ -3308,7 +3751,19 @@
                 <input type="checkbox" ${disabled.has(u.index) ? "" : "checked"}>
                 <span class="rtpl-sw" style="background:${rgb}"></span>
                 <span class="rtpl-cn">#${u.index} ${escapeHtml(u.name)}</span>
+                <button type="button" class="rtpl-cl-tp">📍</button>
                 <span class="rtpl-cc">${remaining}<span class="rtpl-muted">/${u.count}</span></span>`;
+
+            const tpBtn = row.querySelector(".rtpl-cl-tp");
+            setTeleportState(tpBtn, pc, remaining, !disabled.has(u.index));
+            tpBtn.addEventListener("click", (e) => {
+                // The row is a <label> — keep the click off the checkbox.
+                e.preventDefault();
+                e.stopPropagation();
+                const spot = nearestMissingForColor(t, u.index);
+                if (!spot) { setStatus("No missing pixel of that color found right now.", "error", 4000); return; }
+                teleportToGp(spot.gx, spot.gy);
+            });
 
             row.querySelector("input").addEventListener("change", async (e) => {
                 t.disabled = t.disabled || [];
@@ -3318,7 +3773,9 @@
                 await updateTemplateTiles(t);
                 storeSet();
                 applyAnalysisToCard(t, card);
-                autoAnalyzeTick();
+                // Only this template changed (audit P33): analyse it alone.
+                try { await analyzeTemplate(t); } catch (err) {  }
+                applyAnalysisToCard(t, card);
             });
             list.appendChild(row);
         }
@@ -3336,6 +3793,7 @@
         box.querySelector(".rtpl-cl-all").addEventListener("click", () => setAll(false));
         box.querySelector(".rtpl-cl-none").addEventListener("click", () => setAll(true));
 
+        list.scrollTop = prevScroll;
     }
 
     const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -3499,6 +3957,9 @@
         .rtpl-cl-row{display:flex;align-items:center;gap:6px;font-size:11px;color:#ddd;cursor:pointer;padding:1px 0}
         .rtpl-sw{width:14px;height:14px;border-radius:3px;border:1px solid #0006;flex:0 0 auto}
         .rtpl-cn{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .rtpl-cl-tp{flex:0 0 auto;background:none;border:1px solid #2c333d;border-radius:4px;color:#ccc;cursor:pointer;font-size:10px;line-height:1;padding:2px 4px}
+        .rtpl-cl-tp:hover:not(:disabled){background:#222a33}
+        .rtpl-cl-tp:disabled{opacity:.35;cursor:not-allowed}
         .rtpl-cc{color:#cdd3dc;font-family:ui-monospace,monospace;font-size:10px}
         .rtpl-muted{color:#8a93a0}
         .rtpl-totals{display:flex;gap:8px;flex-wrap:wrap;font-size:12px;font-family:ui-monospace,monospace;margin:2px 0 8px}
@@ -4152,10 +4613,17 @@
         return Math.max(min, Math.min(64, z));
     }
 
+    let fitEditorRetries = 0;
     function fitEditor() {
-        if (!editorState) return;
+        if (!editorState) { fitEditorRetries = 0; return; }
         const fit = computeFitZoom();
-        if (fit == null) { requestAnimationFrame(fitEditor); return; }
+        if (fit == null) {
+            // A hidden editor never measures: stop after a few seconds (audit BUG-58).
+            if (fitEditorRetries++ < 300) requestAnimationFrame(fitEditor);
+            else fitEditorRetries = 0;
+            return;
+        }
+        fitEditorRetries = 0;
         editorState.zoom = fit;
         applyEditorZoom();
     }
@@ -4382,16 +4850,25 @@
         });
     }
 
+    // MapLibre refuses addSource/addLayer only while the style OBJECT is
+    // still loading ("Style is not done loading" — style._loaded false,
+    // i.e. a fresh page or a theme's style swap). isStyleLoaded() is far
+    // stricter: it also waits for every TILE of every source, which right
+    // after a pan/zoom or behind slow satellite fetches can take
+    // arbitrarily long — imports looked stuck on "Decoding…" behind it.
+    function styleAcceptsLayers(m) {
+        try { const s = m && m.style; return !!s && s._loaded !== false; } catch (_) { return true; }
+    }
+
     function whenStyleReady(m) {
         return new Promise((res) => {
-            if (m.isStyleLoaded && m.isStyleLoaded()) return res();
-            const done = () => { m.off("idle", done); m.off("load", done); res(); };
+            if (styleAcceptsLayers(m)) return res();
+            let iv = 0;
+            const done = () => { m.off("styledata", done); m.off("idle", done); m.off("load", done); clearInterval(iv); res(); };
             m.on("load", done);
             m.on("idle", done);
-
-            const iv = setInterval(() => {
-                if (m.isStyleLoaded && m.isStyleLoaded()) { clearInterval(iv); done(); }
-            }, 250);
+            m.on("styledata", done);
+            iv = setInterval(() => { if (styleAcceptsLayers(m)) done(); }, 100);
         });
     }
 
@@ -4447,7 +4924,7 @@
                 }
                 return template;
             });
-            nextId = Math.max(...templates.map((t) => t.id)) + 1;
+            nextId = Math.max(0, ...templates.map((t) => (Number.isFinite(Number(t.id)) ? Number(t.id) : 0))) + 1;
             selectedId = (templates.find((t) => !t.archived) || templates[0]).id;
         }
 
@@ -4458,27 +4935,54 @@
         templates.forEach(queueColorUsage);
         setStatus("Waiting for map…", "progress", 0);
 
-        map = await waitForMap();
+        const first = await waitForMap();
+        announceUpdate();
+        // Embedded in the openplace frontend the host's own onboarding covers
+        // templates — never auto-open the walkthrough on top of it (it stays
+        // reachable via the panel's "?" button).
+        if (!EMBEDDED) showWalkthrough();
+
+        attachKeyboardPan();
+        fetchUserColors();
+        if (EMBEDDED) {
+            // The app owns the profile: it hands over every /me it loads
+            // (audit P13 — no 10 s poll, no account bar, no DOM mirror here).
+            pageWin.addEventListener("openplace:me", (e) => applyMe(e.detail));
+            // The app rebuilds its map after navigating away and back; follow
+            // the new instance (audit BUG-55).
+            pageWin.addEventListener("openplace:map", (e) => {
+                const next = e.detail;
+                if (next && next !== map) void bindMap(next);
+                else if (!next) map = null;
+            });
+        } else {
+            watchLiveChargeStatus();
+            setInterval(fetchUserColors, 10_000);
+            setInterval(updateAccountBar, 1000);
+        }
+
+        setInterval(autoAnalyzeTick, AUTO_INTERVAL);
+
+        await bindMap(first);
+    }
+
+    let mapBindingToken = 0;
+    /** Attach the overlay to a MapLibre instance (initial map, or the app's next one). */
+    async function bindMap(m) {
+        const token = ++mapBindingToken;
+        map = m;
         LOG("map found, waiting for style…");
-        await whenStyleReady(map);
+        await whenStyleReady(m);
+        if (token !== mapBindingToken) return;
         LOG("map ready");
         setStatus("");
-        announceUpdate();
-        showWalkthrough();
 
         buildOverlay();
         attachPickHandler();
-        attachKeyboardPan();
+        for (const t of templates) { t._tiles = new Map(); t._dotTiles = new Map(); t._inViewport = false; }
         await reAddAllLayers();
         for (const t of templates) if (templateCanBackgroundWork(t)) queueColorUsage(t);
         updateOverlay();
-
-        fetchUserColors();
-        watchLiveChargeStatus();
-        setInterval(fetchUserColors, 10_000);
-        setInterval(updateAccountBar, 1000);
-
-        setInterval(autoAnalyzeTick, AUTO_INTERVAL);
         autoAnalyzeTick();
 
         let zoomDebounce = null, viewportRenderTimer = null, viewportWorkTimer = null, viewportWorkVersion = 0;
@@ -4498,7 +5002,7 @@
             viewportRenderTimer = setTimeout(() => {
                 if (version !== viewportWorkVersion || map.isMoving?.()) return;
                 refreshViewportTemplateRenders();
-                for (const t of templates) if (t._mode === "dots" && largeDotTemplate(t) && templateInViewport(t)) queueTemplateRender(t);
+                for (const t of templates) if (t._mode === "dots" && templateInViewport(t)) queueTemplateRender(t);
             }, 120);
             viewportWorkTimer = setTimeout(() => {
                 if (version !== viewportWorkVersion || map.isMoving?.()) return;
@@ -4507,7 +5011,7 @@
             }, 450);
         });
 
-        map.on("style.load", () => { reAddAllLayers().then(updateOverlay); });
+        map.on("style.load", () => { if (map === m) reAddAllLayers().then(updateOverlay); });
     }
 
     setupPaintFilter();
