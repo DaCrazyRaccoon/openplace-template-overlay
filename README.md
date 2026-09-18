@@ -44,7 +44,7 @@ Install [Tampermonkey for Safari](https://www.tampermonkey.net/index.php?browser
 ## Use
 
 1. Open the **Templates** panel from the button in the lower-left corner.
-2. Select **Add image**, or drag an image onto the page.
+2. Select **Add image**, or drag an image onto the page. Aseprite files (`.ase` / `.aseprite`) work too; a file with several layers asks whether to add each layer as its own template or one flattened template.
 3. If a map pixel is selected first, the template starts with its top-left corner at that pixel.
 4. Drag a template to move it. Turn on **Edit mode** to resize it with handles.
 5. Expand a template card for its per-template controls.

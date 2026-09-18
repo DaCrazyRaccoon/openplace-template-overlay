@@ -3,7 +3,7 @@
 // @namespace    https://github.com/DaCrazyRaccoon/
 // @description  Drag-and-drop image template overlays for openplace, with responsive large-image editing, palette dithering, and grid-aligned resizing.
 // @license      MPL-2.0
-// @version      1.11.3
+// @version      1.12.0
 // @updateURL    https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @downloadURL  https://raw.githubusercontent.com/DaCrazyRaccoon/openplace-template-tool/main/openplace-Template-Overlay.user.js
 // @homepageURL  https://github.com/DaCrazyRaccoon/openplace-template-tool
@@ -33,8 +33,9 @@
     const SCALE_ALGORITHMS = [["nearest","Nearest-neighbor (crisp)"],["low","Smooth — low quality"],["medium","Smooth — medium quality"],["high","Smooth — high quality"]];
 
     const LOG = (...a) => console.log("%c[Template]", "color:#3a86ff", ...a);
-    const SCRIPT_VERSION = "1.11.3";
+    const SCRIPT_VERSION = "1.12.0";
     const CHANGELOG = [
+        { version: "1.12.0", changes: [["Added", "Aseprite files (.ase / .aseprite) import like any image: Add image, drag and drop, and the editor. The first frame is used, composited like Aseprite (visible layers, opacity, blend modes, tilemaps)."], ["Added", "A multi-layer Aseprite file asks whether to add each layer as its own aligned template or one flattened template."]] },
         { version: "1.11.3", changes: [["Added", "Settings: the missing-pixel limit for the color list's 📍 button is adjustable (1–1000, default 100)."], ["Changed", "📍 cycles through the color's missing pixels from the top-left in reading order; Shift+click steps back, Ctrl+click (or Alt/Cmd+click on macOS) restarts at the first."]] },
         { version: "1.11.2", changes: [["Fixed", "Clicking a favourite pin selects its pixel for the overlay too: Copy coordinates, Use selected pixel and image drops use the pin instead of the previous map click (or none)."]] },
         { version: "1.11.1", changes: [["Changed", "Internal clean-up only: the template signature is computed in one place."]] },
@@ -1321,7 +1322,8 @@
         map.triggerRepaint();
     }
 
-    const isImageFile = (f) => !!f && (/^image\//.test(f.type || "") || /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(f.name || ""));
+    const isImageFile = (f) => !!f && (/^image\//.test(f.type || "") || /\.(png|jpe?g|gif|webp|bmp|avif|ase|aseprite)$/i.test(f.name || ""));
+    const isAsepriteFile = (f) => !!f && /\.(ase|aseprite)$/i.test(f.name || "");
     function importError(f, e) { return `Couldn't import “${f?.name || "image"}”: ${e?.message || "unknown browser error"}`; }
 
     async function canvasToPreparedImage(canvas) {
@@ -1517,8 +1519,260 @@
         return { ...result, sourceW: dimensions.w, sourceH: dimensions.h, scaled: true };
     }
 
+    // ---- Aseprite (.ase / .aseprite) ---------------------------------------
+    // Follows docs/ase-file-specs.md from the Aseprite repository. Only the
+    // first frame is read (it carries the layer list, the palette, the
+    // tilesets and the cels we draw). Layers are composited the way Aseprite
+    // renders them: visible layers only, cel × layer opacity, blend modes
+    // (canvas compositing uses the same PDF blend formulas), groups
+    // composited separately when the header says so, cel z-index order.
+    // Blend mode index (layer chunk) → canvas globalCompositeOperation.
+    // Addition ≈ "lighter"; Subtract and Divide have no canvas equivalent.
+    const ASE_BLEND = ["source-over", "multiply", "screen", "overlay", "darken", "lighten", "color-dodge", "color-burn", "hard-light", "soft-light", "difference", "exclusion", "hue", "saturation", "color", "luminosity", "lighter", "source-over", "source-over"];
+
+    async function inflateZlib(bytes) {
+        if (typeof DecompressionStream !== "function") throw new Error("this browser cannot decompress Aseprite files");
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    /**
+     * Parse an Aseprite file. Returns { width, height, frames, layers, flatten, renderLayer }:
+     * layers = the shown image/tilemap layers that have a cel in the first
+     * frame (back to front), flatten() = composited canvas, renderLayer(l) =
+     * that layer alone (full opacity, normal blend) on a sprite-sized canvas.
+     */
+    async function decodeAseprite(buffer) {
+        const dv = new DataView(buffer), bytes = new Uint8Array(buffer);
+        const u8 = (p) => dv.getUint8(p), u16 = (p) => dv.getUint16(p, true), i16 = (p) => dv.getInt16(p, true), u32 = (p) => dv.getUint32(p, true);
+        if (buffer.byteLength < 128 || u16(4) !== 0xA5E0) throw new Error("not an Aseprite file (bad magic number)");
+        const frames = u16(6), width = u16(8), height = u16(10), depth = u16(12), flags = u32(14), transparentIndex = u8(28);
+        if (depth !== 32 && depth !== 16 && depth !== 8) throw new Error(`unsupported color depth (${depth} bpp)`);
+        if (!width || !height || !frames) throw new Error("the sprite is empty");
+        const layerOpacityValid = !!(flags & 1), groupBlendValid = !!(flags & 2);
+        let palette = new Uint8Array(256 * 4).fill(255);
+        const ensurePalette = (n) => { if (n * 4 > palette.length) { const next = new Uint8Array(n * 4).fill(255); next.set(palette); palette = next; } };
+        let hasNewPalette = false;
+        const layers = [], cels = [], tilesets = new Map();
+        const readString = (p) => { const len = u16(p); return [new TextDecoder().decode(bytes.subarray(p + 2, p + 2 + len)), p + 2 + len]; };
+
+        let off = 128;
+        if (off + 16 > buffer.byteLength) throw new Error("truncated file");
+        const frameBytes = u32(off);
+        if (u16(off + 4) !== 0xF1FA) throw new Error("corrupt frame header");
+        const chunkCount = u32(off + 12) || u16(off + 6);
+        const frameEnd = Math.min(buffer.byteLength, off + frameBytes);
+        off += 16;
+        for (let c = 0; c < chunkCount && off + 6 <= frameEnd; c++) {
+            const size = u32(off), type = u16(off + 4);
+            if (size < 6 || off + size > frameEnd) throw new Error("corrupt chunk");
+            const p = off + 6, end = off + size;
+            if ((type === 0x0004 || type === 0x0011) && !hasNewPalette) {
+                const scale = type === 0x0011 ? 4 : 1; // 0x0011 stores 0–63
+                let q = p + 2, index = 0;
+                for (let packets = u16(p); packets > 0 && q + 2 <= end; packets--) {
+                    index += u8(q); const count = u8(q + 1) || 256; q += 2;
+                    ensurePalette(index + count);
+                    for (let i = 0; i < count && q + 3 <= end; i++, index++, q += 3) {
+                        palette[index * 4] = u8(q) * scale; palette[index * 4 + 1] = u8(q + 1) * scale; palette[index * 4 + 2] = u8(q + 2) * scale; palette[index * 4 + 3] = 255;
+                    }
+                }
+            } else if (type === 0x2019) {
+                hasNewPalette = true;
+                const from = u32(p + 4), to = u32(p + 8);
+                ensurePalette(Math.max(u32(p), to + 1));
+                let q = p + 20;
+                for (let i = from; i <= to && q + 6 <= end; i++) {
+                    const entryFlags = u16(q);
+                    palette[i * 4] = u8(q + 2); palette[i * 4 + 1] = u8(q + 3); palette[i * 4 + 2] = u8(q + 4); palette[i * 4 + 3] = u8(q + 5);
+                    q += 6;
+                    if (entryFlags & 1) q = readString(q)[1];
+                }
+            } else if (type === 0x2004) {
+                const lflags = u16(p), ltype = u16(p + 2), childLevel = u16(p + 4), blend = u16(p + 10), opacity = u8(p + 12);
+                const [name, q] = readString(p + 16);
+                layers.push({ index: layers.length, name, type: ltype, childLevel, blend, opacity, tilesetIndex: ltype === 2 ? u32(q) : -1, visible: !!(lflags & 1), background: !!(lflags & 8), reference: !!(lflags & 64), children: [], cels: [] });
+            } else if (type === 0x2005) {
+                const cel = { layerIndex: u16(p), x: i16(p + 2), y: i16(p + 4), opacity: u8(p + 6), type: u16(p + 7), zIndex: i16(p + 9) };
+                const q = p + 16;
+                if (cel.type === 0 || cel.type === 2) { cel.w = u16(q); cel.h = u16(q + 2); cel.data = bytes.subarray(q + 4, end); }
+                else if (cel.type === 3) { cel.w = u16(q); cel.h = u16(q + 2); cel.bitsPerTile = u16(q + 4) || 32; cel.idMask = u32(q + 6); cel.xMask = u32(q + 10); cel.yMask = u32(q + 14); cel.dMask = u32(q + 18); cel.data = bytes.subarray(q + 32, end); }
+                // Linked cels (type 1) can't point anywhere from the first frame.
+                if (cel.type !== 1 && cel.w && cel.h) cels.push(cel);
+            } else if (type === 0x2023) {
+                const ts = { id: u32(p), flags: u32(p + 4), count: u32(p + 8), tw: u16(p + 12), th: u16(p + 14), data: null };
+                let q = readString(p + 32)[1];
+                if (ts.flags & 1) q += 8; // external file reference: nothing we can load
+                if (ts.flags & 2) { const len = u32(q); ts.data = bytes.subarray(q + 4, Math.min(end, q + 4 + len)); }
+                tilesets.set(ts.id, ts);
+            }
+            off = end;
+        }
+        if (!layers.length) throw new Error("the file has no layers");
+
+        // Layer tree from the child levels (NOTE.1); cels by layer index (NOTE.2).
+        const roots = [], stack = [];
+        for (const layer of layers) {
+            stack.length = Math.min(stack.length, layer.childLevel);
+            const parent = stack[layer.childLevel - 1];
+            (parent ? parent.children : roots).push(layer);
+            stack[layer.childLevel] = layer;
+        }
+        for (const cel of cels) layers[cel.layerIndex]?.cels.push(cel);
+        const markShown = (list, shown) => { for (const l of list) { l.shown = shown && l.visible && !l.reference; markShown(l.children, l.shown); } };
+        markShown(roots, true);
+
+        const bytesPerPixel = depth / 8;
+        const toRGBA = (raw, w, h, isBackground) => {
+            const out = new Uint8ClampedArray(w * h * 4);
+            if (raw.length < w * h * bytesPerPixel) throw new Error("truncated image data");
+            if (depth === 32) out.set(raw.subarray(0, out.length));
+            else if (depth === 16) for (let i = 0, j = 0; j < out.length; i += 2, j += 4) { out[j] = out[j + 1] = out[j + 2] = raw[i]; out[j + 3] = raw[i + 1]; }
+            else for (let i = 0, j = 0; j < out.length; i++, j += 4) {
+                const idx = raw[i];
+                if (idx === transparentIndex && !isBackground) continue;
+                out[j] = palette[idx * 4]; out[j + 1] = palette[idx * 4 + 1]; out[j + 2] = palette[idx * 4 + 2]; out[j + 3] = palette[idx * 4 + 3];
+            }
+            return out;
+        };
+        const rgbaCanvas = (rgba, w, h) => {
+            const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+            cv.getContext("2d").putImageData(new ImageData(rgba, w, h), 0, 0);
+            return cv;
+        };
+        const celBitmap = async (cel, isBackground) => rgbaCanvas(toRGBA(cel.type === 2 ? await inflateZlib(cel.data) : cel.data, cel.w, cel.h, isBackground), cel.w, cel.h);
+        const tilesetCanvas = new Map();
+        const tilesetImage = async (ts) => {
+            if (!tilesetCanvas.has(ts.id)) {
+                const usable = ts.data && ts.count > 0 && ts.tw > 0 && ts.th > 0;
+                tilesetCanvas.set(ts.id, usable ? rgbaCanvas(toRGBA(await inflateZlib(ts.data), ts.tw, ts.th * ts.count, false), ts.tw, ts.th * ts.count) : null);
+            }
+            return tilesetCanvas.get(ts.id);
+        };
+        const tilemapBitmap = async (cel, layer) => {
+            const ts = tilesets.get(layer.tilesetIndex);
+            const sheet = ts ? await tilesetImage(ts) : null;
+            const cv = document.createElement("canvas");
+            cv.width = Math.max(1, cel.w * (ts?.tw || 1)); cv.height = Math.max(1, cel.h * (ts?.th || 1));
+            if (!sheet) return cv;
+            const ctx = cv.getContext("2d");
+            const raw = await inflateZlib(cel.data);
+            const tdv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength), stride = cel.bitsPerTile / 8;
+            const empty = (ts.flags & 4) ? 0 : 0xffffffff;
+            for (let ty = 0; ty < cel.h; ty++) for (let tx = 0; tx < cel.w; tx++) {
+                const at = (ty * cel.w + tx) * stride;
+                if (at + stride > raw.length) return cv;
+                const value = stride === 1 ? tdv.getUint8(at) : stride === 2 ? tdv.getUint16(at, true) : tdv.getUint32(at, true);
+                if (value === empty) continue;
+                const id = (value & cel.idMask) >>> 0;
+                if (id >= ts.count) continue;
+                ctx.save();
+                ctx.translate(tx * ts.tw + ts.tw / 2, ty * ts.th + ts.th / 2);
+                if (value & cel.dMask) ctx.transform(0, 1, 1, 0, 0, 0);
+                ctx.scale(value & cel.xMask ? -1 : 1, value & cel.yMask ? -1 : 1);
+                ctx.drawImage(sheet, 0, id * ts.th, ts.tw, ts.th, -ts.tw / 2, -ts.th / 2, ts.tw, ts.th);
+                ctx.restore();
+            }
+            return cv;
+        };
+        const drawCel = async (ctx, layer, cel, alpha, blend) => {
+            const bitmap = cel.type === 3 ? await tilemapBitmap(cel, layer) : await celBitmap(cel, layer.background);
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.globalCompositeOperation = blend;
+            ctx.drawImage(bitmap, cel.x, cel.y);
+            ctx.restore();
+        };
+        const layerAlpha = (layer) => layerOpacityValid ? layer.opacity / 255 : 1;
+        const blendOp = (mode) => ASE_BLEND[mode] || "source-over";
+        // Siblings in file order are back to front; cel z-index re-orders them (NOTE.5).
+        const renderList = async (list, ctx) => {
+            const items = [];
+            for (const layer of list) {
+                if (!layer.shown) continue;
+                if (layer.type === 1) items.push({ layer, order: layer.index, z: 0 });
+                else for (const cel of layer.cels) items.push({ layer, cel, order: layer.index + cel.zIndex, z: cel.zIndex });
+            }
+            items.sort((a, b) => a.order - b.order || a.z - b.z);
+            for (const it of items) {
+                if (it.cel) { await drawCel(ctx, it.layer, it.cel, (it.cel.opacity / 255) * layerAlpha(it.layer), blendOp(it.layer.blend)); continue; }
+                if (!groupBlendValid) { await renderList(it.layer.children, ctx); continue; }
+                const cv = document.createElement("canvas"); cv.width = width; cv.height = height;
+                await renderList(it.layer.children, cv.getContext("2d"));
+                ctx.save(); ctx.globalAlpha = layerAlpha(it.layer); ctx.globalCompositeOperation = blendOp(it.layer.blend); ctx.drawImage(cv, 0, 0); ctx.restore();
+            }
+        };
+        const flatten = async () => {
+            const cv = document.createElement("canvas"); cv.width = width; cv.height = height;
+            await renderList(roots, cv.getContext("2d"));
+            return cv;
+        };
+        const renderLayer = async (layer) => {
+            const cv = document.createElement("canvas"); cv.width = width; cv.height = height;
+            const ctx = cv.getContext("2d");
+            for (const cel of layer.cels) await drawCel(ctx, layer, cel, 1, "source-over");
+            return cv;
+        };
+        return { width, height, frames, layers: layers.filter((l) => l.shown && l.type !== 1 && l.cels.length), flatten, renderLayer };
+    }
+
+    /** prepareImageFile() for Aseprite files: the flattened first frame, plus
+     *  per-layer preparation for the "one template per layer" import. */
+    async function prepareAsepriteFile(file) {
+        showToast(`Decoding ${file.name}…`, "progress", 0);
+        let ase;
+        try { ase = await decodeAseprite(await file.arrayBuffer()); }
+        catch (e) { throw new Error(`Aseprite decode failed: ${e?.message || e}`); }
+        if (ase.width > 16384 || ase.height > 16384) throw new Error(`${ase.width}×${ase.height} is too large for the browser's canvas.`);
+        const safe = safeWorkingSize(ase.width, ase.height);
+        const prepareCanvas = async (canvas) => {
+            const result = safe.scaled ? await decodedFrameToImage(canvas, safe.w, safe.h) : await canvasToPreparedImage(canvas);
+            return { ...result, sourceW: ase.width, sourceH: ase.height, scaled: safe.scaled };
+        };
+        const prepared = await prepareCanvas(await ase.flatten());
+        prepared.ase = { layers: ase.layers, frames: ase.frames, prepareLayer: async (layer) => prepareCanvas(await ase.renderLayer(layer)) };
+        return prepared;
+    }
+
+    /** Modal choice: resolves with the picked option's value, or null on cancel / Escape / backdrop click. */
+    function chooseDialog({ title, text, options, cancelLabel = "Cancel" }) {
+        return new Promise((resolve) => {
+            const root = document.createElement("div");
+            root.className = "rtpl-share-dialog"; // shares the modal look and the light-theme rules
+            root.classList.toggle("rtpl-light", uiTheme === "light");
+            Object.assign(root.style, { position: "fixed", inset: "0", zIndex: "2147483647", display: "flex", alignItems: "center", justifyContent: "center", padding: "16px", background: "rgba(0,0,0,.62)" });
+            const box = document.createElement("div");
+            Object.assign(box.style, { width: "min(440px,100%)", boxSizing: "border-box", display: "flex", flexDirection: "column", gap: "12px", padding: "20px", border: "1px solid #344150", borderRadius: "14px", background: "#10161c", color: "#eef3f8", font: "13px system-ui,sans-serif", boxShadow: "0 18px 48px #0009" });
+            const heading = document.createElement("div"); heading.textContent = title;
+            Object.assign(heading.style, { fontSize: "16px", fontWeight: "700", textAlign: "center" });
+            const body = document.createElement("div"); body.textContent = text;
+            Object.assign(body.style, { color: "#b7c3d0", lineHeight: "1.45", textAlign: "center" });
+            const actions = document.createElement("div");
+            Object.assign(actions.style, { display: "flex", flexDirection: "column", gap: "8px", marginTop: "2px" });
+            const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(null); } };
+            const finish = (value) => { document.removeEventListener("keydown", onKey, true); root.remove(); resolve(value); };
+            options.forEach((opt, i) => {
+                const b = document.createElement("button"); b.type = "button"; b.textContent = opt.label;
+                Object.assign(b.style, { width: "100%", minHeight: "40px", borderRadius: "7px", cursor: "pointer", fontWeight: "650", color: "#fff", border: i === 0 ? "1px solid #4a82ed" : "1px solid #344150", background: i === 0 ? "#477df0" : "#1b232c" });
+                b.addEventListener("click", () => finish(opt.value));
+                actions.appendChild(b);
+                if (i === 0) setTimeout(() => b.focus(), 0);
+            });
+            const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = cancelLabel;
+            Object.assign(cancel.style, { alignSelf: "center", padding: "3px 8px", border: "none", background: "transparent", color: "#9eabb9", fontSize: "11px", cursor: "pointer" });
+            cancel.addEventListener("click", () => finish(null));
+            actions.appendChild(cancel);
+            root.addEventListener("click", (e) => { if (e.target === root) finish(null); });
+            document.addEventListener("keydown", onKey, true);
+            box.append(heading, body, actions);
+            root.appendChild(box);
+            document.body.appendChild(root);
+        });
+    }
+
     async function prepareImageFile(file) {
         if (!isImageFile(file)) throw new Error("Please choose a supported image file.");
+        if (isAsepriteFile(file)) return prepareAsepriteFile(file);
         showToast(`Reading ${file.name}…`, "progress", 0);
         const dimensions = await readImageDimensions(file);
         const large = !!dimensions && safeWorkingSize(dimensions.w, dimensions.h).scaled;
@@ -1579,7 +1833,31 @@
     async function createTemplateFromFile(file, lngLat) {
         try {
             const prepared = await prepareImageFile(file);
-            const t = await addTemplateFromDataUrl(prepared.dataUrl, file.name.replace(/\.[^.]+$/, ""), lngLat, prepared.img);
+            const base = file.name.replace(/\.[^.]+$/, "");
+            const layers = prepared.ase?.layers || [];
+            if (layers.length > 1) {
+                const frameNote = prepared.ase.frames > 1 ? ` Only the first of ${prepared.ase.frames} frames is used.` : "";
+                const choice = await chooseDialog({
+                    title: `“${file.name}” has ${layers.length} layers`,
+                    text: `Add each visible layer as its own template (they stay aligned, so you can show, lock and check them separately), or flatten them into one template?${frameNote}`,
+                    options: [{ value: "layers", label: `${layers.length} templates — one per layer` }, { value: "single", label: "One flattened template" }]
+                });
+                if (!choice) { showToast("Import cancelled.", "info"); return null; }
+                if (choice === "layers") {
+                    let first = null, position = null;
+                    for (const layer of layers) {
+                        showToast(`Preparing layer “${layer.name}”…`, "progress", 0);
+                        const p = await prepared.ase.prepareLayer(layer);
+                        // Every layer canvas is sprite-sized: pin the rest to the first one's spot.
+                        const t = await addTemplateFromDataUrl(p.dataUrl, `${base} – ${layer.name}`, lngLat, p.img, position);
+                        if (!t) break;
+                        if (!first) { first = t; position = [t.gx, t.gy]; }
+                    }
+                    if (first) showToast(`Added ${layers.length} layer templates from “${file.name}”.`, "success");
+                    return first;
+                }
+            }
+            const t = await addTemplateFromDataUrl(prepared.dataUrl, base, lngLat, prepared.img);
             if (t) showToast(prepared.scaled ? `Added “${file.name}” at ${prepared.img.naturalWidth}×${prepared.img.naturalHeight}.` : `Added “${file.name}”.`, "success");
             return t;
         } catch (e) { LOG("image import failed", e); const m = importError(file, e); showToast(m, "error", 7000); return null; }
@@ -2541,8 +2819,8 @@
                 const res = await fetch(url, { mode: "cors" });
                 if (!res.ok) throw new Error("HTTP " + res.status);
                 const blob = await res.blob();
-                if (!/^image\//.test(blob.type || "")) throw new Error("The link does not point to an image.");
                 const name = decodeURIComponent((url.split("/").pop() || "").split("?")[0]) || "dropped-image";
+                if (!/^image\//.test(blob.type || "") && !isAsepriteFile({ name })) throw new Error("The link does not point to an image.");
                 await importAll([new File([blob], name, { type: blob.type })]);
             } catch (err) {
                 LOG("image link drop failed", err);
@@ -2675,7 +2953,7 @@
                 <button class="rtpl-add rtpl-addimg">Add image</button>
                 <button class="rtpl-add rtpl-openeditor">Image editor</button>
                 <button class="rtpl-add rtpl-importcode">Import code</button>
-                <input type="file" accept="image/*" multiple class="rtpl-file" hidden>
+                <input type="file" accept="image/*,.ase,.aseprite" multiple class="rtpl-file" hidden>
             </div>
             ${EMBEDDED ? "" : `
             <div class="rtpl-actions rtpl-tp">
@@ -4321,7 +4599,7 @@
             </div>
             <div class="rtpl-ed-controls">
                 <button class="rtpl-add rtpl-ed-import">Import image…</button>
-                <input type="file" accept="image/*" class="rtpl-ed-file" hidden>
+                <input type="file" accept="image/*,.ase,.aseprite" class="rtpl-ed-file" hidden>
                 <div class="rtpl-ed-transform"><button class="rtpl-toggle rtpl-ed-rotate-l" title="Rotate left" aria-label="Rotate left">↶</button><button class="rtpl-toggle rtpl-ed-rotate-r" title="Rotate right" aria-label="Rotate right">↷</button><button class="rtpl-toggle rtpl-ed-flip-h" title="Flip horizontally" aria-label="Flip horizontally">⇄</button><button class="rtpl-toggle rtpl-ed-flip-v" title="Flip vertically" aria-label="Flip vertically">⇅</button></div>
                 <label class="rtpl-ed-ctl">Preset
                     <select class="rtpl-ed-preset"></select>
