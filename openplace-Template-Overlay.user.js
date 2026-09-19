@@ -35,7 +35,7 @@
     const LOG = (...a) => console.log("%c[Template]", "color:#3a86ff", ...a);
     const SCRIPT_VERSION = "1.12.0";
     const CHANGELOG = [
-        { version: "1.12.0", changes: [["Added", "Aseprite files (.ase / .aseprite) import like any image: Add image, drag and drop, and the editor. The first frame is used, composited like Aseprite (visible layers, opacity, blend modes, tilemaps)."], ["Added", "A multi-layer Aseprite file asks whether to add each layer as its own aligned template or one flattened template."]] },
+        { version: "1.12.0", changes: [["Added", "Aseprite files (.ase / .aseprite) import like any image: Add image, drag and drop, and the editor. The first frame is used, composited like Aseprite (visible layers, opacity, blend modes, tilemaps)."], ["Added", "A multi-layer Aseprite file asks whether to add each layer as its own aligned template or one flattened template."], ["Fixed", "A theme or satellite switch on the page no longer sends the map into an endless style rebuild (page frozen, \"getStyle() is undefined\" and \"Style is not done loading\" errors) while templates are on the map: the overlay lifts its layers off the map for the page's style swap and puts them back afterwards."]] },
         { version: "1.11.3", changes: [["Added", "Settings: the missing-pixel limit for the color list's 📍 button is adjustable (1–1000, default 100)."], ["Changed", "📍 cycles through the color's missing pixels from the top-left in reading order; Shift+click steps back, Ctrl+click (or Alt/Cmd+click on macOS) restarts at the first."]] },
         { version: "1.11.2", changes: [["Fixed", "Clicking a favourite pin selects its pixel for the overlay too: Copy coordinates, Use selected pixel and image drops use the pin instead of the previous map click (or none)."]] },
         { version: "1.11.1", changes: [["Changed", "Internal clean-up only: the template signature is computed in one place."]] },
@@ -1181,6 +1181,10 @@
                 // A resized canvas is re-read by the source on the next
                 // refresh (audit P34): no remove/add per zoom step.
                 if (fresh || !map.getSource(e.sourceId)) {
+                    // The style can have started rebuilding during the awaits
+                    // above; MapLibre then throws "Style is not done loading".
+                    // Stop here — the style.load handler re-adds everything.
+                    if (!styleAcceptsLayers(map)) return added;
                     if (map.getLayer(e.layerId)) map.removeLayer(e.layerId);
                     if (map.getSource(e.sourceId)) map.removeSource(e.sourceId);
                     map.addSource(e.sourceId, { type: "canvas", canvas: e.canvas, coordinates: coords, animate: false });
@@ -1278,6 +1282,7 @@
                 const coords = rasterCoordinates(ix0, ix1, iy0, iy1);
 
                 if (fresh || !map.getSource(e.sourceId)) {
+                    if (!styleAcceptsLayers(map)) return added; // style rebuilding: style.load re-adds
                     map.addSource(e.sourceId, { type: "canvas", canvas: e.canvas, coordinates: coords, animate: false });
                     map.addLayer({
                         id: e.layerId, type: "raster", source: e.sourceId,
@@ -5195,9 +5200,14 @@
             t._tiles = new Map();
             t._dotTiles = new Map();
             t._inViewport = false;
+            // Newer version: in-flight renders of the previous pass abort.
+            t._renderVersion = (t._renderVersion || 0) + 1;
             if (!templateInViewport(t)) continue;
             if (largeDotTemplate(t)) deferred.push(t);
-            else await updateTemplateTiles(t);
+            else {
+                await updateTemplateTiles(t, t._renderVersion);
+                if (token !== deferredLayerRenderToken) return; // a newer pass took over
+            }
         }
         if (!deferred.length) return;
         let index = 0;
@@ -5210,6 +5220,44 @@
             else showToast("Large templates loaded.", "success", 3000);
         };
         deferLayerRender(renderNext);
+    }
+
+    // One re-add per burst: a page setStyle() plus the style.load it fires
+    // (or the rebuild it triggers) must not start two passes.
+    let reAddAllLayersTimer = 0;
+    function scheduleReAddAllLayers() {
+        clearTimeout(reAddAllLayersTimer);
+        reAddAllLayersTimer = setTimeout(() => {
+            reAddAllLayersTimer = 0;
+            if (map) reAddAllLayers().then(updateOverlay).catch((e) => LOG("re-adding layers failed", e));
+        }, 0);
+    }
+
+    // ---- The page's style swaps ----------------------------------------
+    // openplace's setUpMapLayers() calls map.setStyle(style, { diff: true,
+    // transformStyle }) on every style.load and on theme/satellite changes,
+    // and its transformStyle copies EVERY previous source into the next
+    // style. MapLibre's diff (Style.setState) deep-clones that next style;
+    // our canvas sources serialize with the live <canvas> element, cloning
+    // walks the DOM graph until "Maximum call stack size exceeded", MapLibre
+    // rebuilds the style from scratch, the rebuild fires style.load, the page
+    // calls setStyle again… an endless rebuild loop (the page's
+    // "getStyle() is undefined" TypeError and our "Style is not done loading"
+    // on every turn, and a map that never stops reloading). So take our
+    // sources and layers off the map before the page's setStyle runs, and
+    // put them back once it is done.
+    const guardedSetStyleMaps = new WeakSet();
+    function guardHostSetStyle(m) {
+        if (!m || typeof m.setStyle !== "function" || guardedSetStyleMaps.has(m)) return;
+        guardedSetStyleMaps.add(m);
+        const original = m.setStyle;
+        m.setStyle = function (...args) {
+            if (map === m && styleAcceptsLayers(m)) {
+                for (const t of templates) { try { removeFilledTiles(t); removeDotLayer(t); } catch (e) { LOG("detaching layers failed", e); } }
+            }
+            try { return original.apply(this, args); }
+            finally { if (map === m) scheduleReAddAllLayers(); }
+        };
     }
     async function init() {
 
@@ -5280,6 +5328,7 @@
     async function bindMap(m) {
         const token = ++mapBindingToken;
         map = m;
+        guardHostSetStyle(m);
         LOG("map found, waiting for style…");
         await whenStyleReady(m);
         if (token !== mapBindingToken) return;
@@ -5320,7 +5369,7 @@
             }, 450);
         });
 
-        map.on("style.load", () => { if (map === m) reAddAllLayers().then(updateOverlay); });
+        map.on("style.load", () => { if (map === m) scheduleReAddAllLayers(); });
     }
 
     setupPaintFilter();
